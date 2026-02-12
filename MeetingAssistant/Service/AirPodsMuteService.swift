@@ -50,7 +50,20 @@ final class AirPodsMuteService {
         // 1. Start audio engine with voice processing enabled
         startAudioEngineTap()
 
-        // 2. Register stem handler after engine is running
+        // 2. Sync system mute state to match app state
+        // Must be done AFTER establishing active audio session (via engine).
+        // This ensures the system knows we start unmuted (or muted).
+        // Guarded against loops by isProcessingMuteChange if handler is already active.
+        isProcessingMuteChange = true
+        do {
+            try AVAudioApplication.shared.setInputMuted(isMuted)
+            logger.info("Initialized system mute state to \(self.isMuted)")
+        } catch {
+            logger.warning("Could not initialize isInputMuted: \(error.localizedDescription)")
+        }
+        isProcessingMuteChange = false
+
+        // 3. Register stem handler after engine is running
         registerStemHandlerIfNeeded()
 
         logger.info("Always-on stem monitoring started")

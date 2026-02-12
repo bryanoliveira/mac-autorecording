@@ -184,10 +184,11 @@ struct MenuBarDropdownView: View {
         VStack(spacing: 4) {
             // Auto-record toggle
             Toggle(isOn: Bindable(viewModel.settings).autoRecordEnabled) {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Image(systemName: "mic.badge.plus")
-                        .font(.system(size: 13))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .frame(width: 18)
                     Text("Auto-record on mic use")
                         .font(.system(size: 13))
                 }
@@ -195,7 +196,7 @@ struct MenuBarDropdownView: View {
             .toggleStyle(.switch)
             .controlSize(.mini)
             .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.vertical, 5)
 
             // Manual record button
             if !viewModel.isInCountdown && !viewModel.isWaitingForContent {
@@ -243,10 +244,11 @@ struct MenuBarDropdownView: View {
 
             // Always-on stem toggle
             Toggle(isOn: Bindable(viewModel.settings).alwaysOnStemMonitoring) {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Image(systemName: "airpodspro")
-                        .font(.system(size: 12))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .frame(width: 18)
                     Text("AirPods stem mute")
                         .font(.system(size: 13))
                 }
@@ -254,7 +256,7 @@ struct MenuBarDropdownView: View {
             .toggleStyle(.switch)
             .controlSize(.mini)
             .padding(.horizontal, 8)
-            .padding(.vertical, 2)
+            .padding(.vertical, 5)
             .onChange(of: viewModel.settings.alwaysOnStemMonitoring) {
                 if viewModel.settings.alwaysOnStemMonitoring && viewModel.settings.autoRecordEnabled {
                     viewModel.settings.autoRecordEnabled = false

@@ -47,24 +47,23 @@ final class AirPodsMuteService {
         savedInputVolume = getSystemInputVolume()
         if savedInputVolume < 5 { savedInputVolume = 100 }
 
-        // 1. Start audio engine with voice processing enabled
+        // 1. Start audio engine
         startAudioEngineTap()
 
-        // 2. Sync system mute state to match app state
-        // Must be done AFTER establishing active audio session (via engine).
-        // This ensures the system knows we start unmuted (or muted).
-        // Guarded against loops by isProcessingMuteChange if handler is already active.
+        // 2. Register stem handler (MUST be before Sync)
+        registerStemHandlerIfNeeded()
+
+        // 3. Sync system mute state to match app state
+        // Done AFTER registration so setInputMuted succeeds (requires handler).
+        // Guarded against loops by isProcessingMuteChange.
         isProcessingMuteChange = true
         do {
-            try AVAudioApplication.shared.setInputMuted(isMuted)
+            try AVAudioApplication.shared.setInputMuted(self.isMuted)
             logger.info("Initialized system mute state to \(self.isMuted)")
         } catch {
             logger.warning("Could not initialize isInputMuted: \(error.localizedDescription)")
         }
         isProcessingMuteChange = false
-
-        // 3. Register stem handler after engine is running
-        registerStemHandlerIfNeeded()
 
         logger.info("Always-on stem monitoring started")
     }
@@ -152,7 +151,13 @@ final class AirPodsMuteService {
         // 2. Install silent input tap (Uplink)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { _, _ in }
 
-        // 3. Connect Mixer to Output (Downlink) with EXPLICIT output format
+        // 3. Complete the Graph: Input -> Mixer -> Output
+        // VoiceProcessingIO requires a complete signal path to avoid DSP errors ("state fault").
+        // We connect Input to Mixer, and Mixer to Output (below).
+        // The mixer output volume is 0 so no audio plays out.
+        engine.connect(inputNode, to: engine.mainMixerNode, format: inputFormat)
+
+        // 4. Connect Mixer to Output (Downlink) with EXPLICIT output format
         // This is critical to satisfy VoiceProcessingIO's full-duplex requirement
         // and matching the hardware sample rate on the output side.
         engine.connect(engine.mainMixerNode, to: outputNode, format: outputFormat)

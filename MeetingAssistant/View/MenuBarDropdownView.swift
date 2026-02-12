@@ -231,37 +231,17 @@ struct MenuBarDropdownView: View {
                 viewModel.toggleMicMute()
             }
 
-            // Shortcut hint
+            // Shortcut hint — aligned with button labels (28px offset = 18px icon + 10px spacing)
             if viewModel.settings.muteShortcutEnabled {
-                HStack {
+                HStack(spacing: 10) {
+                    Spacer()
+                        .frame(width: 18)
                     Spacer()
                     Text(viewModel.settings.muteShortcutDisplayString)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
                 .padding(.horizontal, 8)
-            }
-
-            // Always-on stem toggle
-            Toggle(isOn: Bindable(viewModel.settings).alwaysOnStemMonitoring) {
-                HStack(spacing: 10) {
-                    Image(systemName: "airpodspro")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 18)
-                    Text("AirPods stem mute")
-                        .font(.system(size: 13))
-                }
-            }
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .onChange(of: viewModel.settings.alwaysOnStemMonitoring) {
-                if viewModel.settings.alwaysOnStemMonitoring && viewModel.settings.autoRecordEnabled {
-                    viewModel.settings.autoRecordEnabled = false
-                }
-                viewModel.updateStemMonitoring()
             }
         }
     }

@@ -60,12 +60,6 @@ struct GeneralSettingsView: View {
                 Toggle("Include system audio", isOn: $settings.includeSystemAudio)
 
                 Toggle("Auto-record on mic activity", isOn: $settings.autoRecordEnabled)
-                    .onChange(of: settings.autoRecordEnabled) {
-                        if settings.autoRecordEnabled && settings.alwaysOnStemMonitoring {
-                            settings.alwaysOnStemMonitoring = false
-                            viewModel.updateStemMonitoring()
-                        }
-                    }
 
                 if settings.autoRecordEnabled {
                     Text("Automatically starts recording when any app activates the microphone.")
@@ -185,35 +179,6 @@ struct MicrophoneSettingsView: View {
                     Text("Works globally regardless of which app is focused.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("AirPods Stem Mute") {
-                Toggle("During-call stem mute (experimental)", isOn: $settings.airpodsStemMuteEnabled)
-
-                Text("Attempts to detect AirPods stem presses during active recordings. May not work reliably — macOS routes stem events to the frontmost app. Try exporting a release build if it doesn't work in debug mode.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Always-On Mic Monitoring") {
-                Toggle("Always monitor mic for stem events", isOn: $settings.alwaysOnStemMonitoring)
-                    .onChange(of: settings.alwaysOnStemMonitoring) {
-                        if settings.alwaysOnStemMonitoring && settings.autoRecordEnabled {
-                            settings.autoRecordEnabled = false
-                        }
-                        viewModel.updateStemMonitoring()
-                    }
-
-                if settings.alwaysOnStemMonitoring {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.yellow)
-                            .font(.system(size: 11))
-                        Text("Keeps the mic active. The mic indicator will appear in the menu bar. Incompatible with auto-record.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
                 }
             }
         }

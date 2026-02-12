@@ -156,11 +156,6 @@ final class MeetingRecorderViewModel {
     func startMonitoring() {
         micMonitorService.startMonitoring()
 
-        // Start always-on stem monitoring if enabled (separate from in-call stem)
-        if settings.alwaysOnStemMonitoring {
-            airPodsMuteService.startAlwaysOnMonitoring()
-        }
-
         // Start global hotkey if enabled
         if settings.muteShortcutEnabled {
             globalHotkeyService.register(
@@ -174,18 +169,10 @@ final class MeetingRecorderViewModel {
 
     func stopMonitoring() {
         micMonitorService.stopMonitoring()
-        airPodsMuteService.stopAlwaysOnMonitoring()
         globalHotkeyService.unregister()
     }
 
-    /// Call when the always-on stem monitoring setting changes
-    func updateStemMonitoring() {
-        if settings.alwaysOnStemMonitoring {
-            airPodsMuteService.startAlwaysOnMonitoring()
-        } else {
-            airPodsMuteService.stopAlwaysOnMonitoring()
-        }
-    }
+
 
     /// Call when keyboard shortcut settings change
     func updateGlobalHotkey() {

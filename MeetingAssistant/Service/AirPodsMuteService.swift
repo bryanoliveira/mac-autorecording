@@ -2,23 +2,15 @@
 //  AirPodsMuteService.swift
 //  MeetingAssistant
 //
-//  Implements system-wide mic mute via AppleScript and detects
-//  AirPods stem press for mute/unmute.
-//
-//  STEM DETECTION ON macOS:
-//  AVAudioSession is iOS-only. On macOS, the equivalent of
-//  configuring a voiceChat audio session is enabling voice
-//  processing on AVAudioEngine's input node. This tells
-//  the audio system that our app is a communication app,
-//  making macOS route AirPods stem events to our handler.
+//  Provides system-wide mic mute/unmute via AppleScript.
+//  Lightweight: no audio engine, no background processing.
+//  Only runs AppleScript when the user toggles mute.
 //
 
-import AVFAudio
-import CoreAudio
 import Foundation
 import OSLog
 
-/// Service that provides mic mute/unmute and AirPods stem detection
+/// Service that provides mic mute/unmute
 @MainActor
 @Observable
 final class AirPodsMuteService {
@@ -26,193 +18,19 @@ final class AirPodsMuteService {
     // MARK: - Properties
 
     private(set) var isMuted = false
-    private(set) var isMonitoring = false
 
-    /// Callback when mute state changes (from stem or manual toggle)
+    /// Callback when mute state changes
     var onMuteStateChanged: ((Bool) -> Void)?
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "MeetingAssistant", category: "AirPodsMuteService")
     private var savedInputVolume: Int = 100
-    private var audioEngine: AVAudioEngine?
-    private var hasRegisteredHandler = false
-    /// Guards against re-entrant handler loops
-    private var isProcessingMuteChange = false
 
-    // MARK: - Always-On Monitoring
-
-    func startAlwaysOnMonitoring() {
-        guard !isMonitoring else { return }
-        isMonitoring = true
-
-        savedInputVolume = getSystemInputVolume()
-        if savedInputVolume < 5 { savedInputVolume = 100 }
-
-        // 1. Start audio engine
-        startAudioEngineTap()
-
-        // 2. Register stem handler (MUST be before Sync)
-        registerStemHandlerIfNeeded()
-
-        // 3. Sync system mute state to match app state
-        // Done AFTER registration so setInputMuted succeeds (requires handler).
-        // Guarded against loops by isProcessingMuteChange.
-        isProcessingMuteChange = true
-        do {
-            try AVAudioApplication.shared.setInputMuted(self.isMuted)
-            logger.info("Initialized system mute state to \(self.isMuted)")
-        } catch {
-            logger.warning("Could not initialize isInputMuted: \(error.localizedDescription)")
-        }
-        isProcessingMuteChange = false
-
-        logger.info("Always-on stem monitoring started")
-    }
-
-    func stopAlwaysOnMonitoring() {
-        guard isMonitoring else { return }
-        isMonitoring = false
-
-        stopAudioEngineTap()
-
-        // Restore volume if muted
-        if isMuted {
-            setSystemInputVolume(savedInputVolume)
-            isMuted = false
-        }
-
-        logger.info("Always-on stem monitoring stopped")
-    }
-
-    // MARK: - Manual Mute Toggle
+    // MARK: - Mute Toggle
 
     func toggleMute() {
-        applyMuteState(muted: !isMuted, fromStemHandler: false)
-    }
+        let newState = !isMuted
 
-    // MARK: - Stem Handler
-
-    private func registerStemHandlerIfNeeded() {
-        guard !hasRegisteredHandler else { return }
-
-        do {
-            try AVAudioApplication.shared.setInputMuteStateChangeHandler { [weak self] requestedMute in
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.logger.info("🎧 Stem handler fired: mute=\(requestedMute)")
-                    self.applyMuteState(muted: requestedMute, fromStemHandler: true)
-                }
-                return true
-            }
-            hasRegisteredHandler = true
-            logger.info("✅ Stem handler registered")
-        } catch {
-            logger.error("❌ Failed to register stem handler: \(error.localizedDescription)")
-        }
-    }
-
-    // MARK: - Audio Engine Tap
-
-    /// Starts AVAudioEngine with voice processing enabled on the input node.
-    /// Voice processing (kAudioUnitSubType_VoiceProcessingIO) is the macOS
-    /// equivalent of AVAudioSession's .voiceChat mode — it tells macOS
-    /// that this app is a communication app, enabling stem event routing.
-    private func startAudioEngineTap() {
-        guard audioEngine == nil else { return }
-
-        let engine = AVAudioEngine()
-
-        // 1. Enable voice processing (switches audio unit type to VP I/O)
-        do {
-            try engine.inputNode.setVoiceProcessingEnabled(true)
-            logger.info("✅ Voice processing enabled on input node")
-        } catch {
-            logger.error("❌ Failed to enable voice processing: \(error.localizedDescription)")
-        }
-
-        let inputNode = engine.inputNode
-        let outputNode = engine.outputNode
-        
-        // Fetch explicit formats to detect mismatch
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        let outputFormat = outputNode.outputFormat(forBus: 0)
-
-        logger.info("Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount)ch")
-        logger.info("Output format: \(outputFormat.sampleRate)Hz, \(outputFormat.channelCount)ch")
-
-        guard inputFormat.sampleRate > 0, outputFormat.sampleRate > 0 else {
-            logger.warning("Invalid audio formats — cannot start engine")
-            return
-        }
-        
-        if inputFormat.sampleRate != outputFormat.sampleRate {
-            logger.warning("⚠️ Sample rate mismatch! VoiceProcessingIO requires valid input/output combinations. Engine start might fail.")
-        }
-
-        // 2. Install silent input tap (Uplink)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { _, _ in }
-
-        // 3. Complete the Graph: Input -> Mixer -> Output
-        // VoiceProcessingIO requires a complete signal path to avoid DSP errors ("state fault").
-        // We connect Input to Mixer, and Mixer to Output (below).
-        // The mixer output volume is 0 so no audio plays out.
-        engine.connect(inputNode, to: engine.mainMixerNode, format: inputFormat)
-
-        // 4. Connect Mixer to Output (Downlink) with EXPLICIT output format
-        // This is critical to satisfy VoiceProcessingIO's full-duplex requirement
-        // and matching the hardware sample rate on the output side.
-        engine.connect(engine.mainMixerNode, to: outputNode, format: outputFormat)
-        engine.mainMixerNode.outputVolume = 0
-
-        do {
-            engine.prepare()
-            try engine.start()
-            audioEngine = engine
-            logger.info("Audio engine started (VoiceProcessingIO active)")
-        } catch {
-            logger.error("❌ Engine start failed: \(error.localizedDescription)")
-            
-            // Fallback: Try disabling VP to restore basic functionality
-            do {
-                logger.info("Retrying without Voice Processing...")
-                try engine.inputNode.setVoiceProcessingEnabled(false)
-                try engine.start()
-                audioEngine = engine
-                logger.info("✅ Audio engine started (Standard mode - No Stem Detection)")
-            } catch {
-                logger.error("❌ Fallback failed: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    private func stopAudioEngineTap() {
-        if let engine = audioEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-            audioEngine = nil
-            logger.info("Audio engine tap stopped")
-        }
-    }
-
-    // MARK: - Mute Implementation
-
-    private func applyMuteState(muted: Bool, fromStemHandler: Bool) {
-        // Guard: prevent re-entrant loops
-        guard !isProcessingMuteChange else {
-            logger.debug("Skipping re-entrant mute change")
-            return
-        }
-
-        // Guard: no-op if state already matches
-        guard isMuted != muted else {
-            logger.debug("Mute state already \(muted) — skipping")
-            return
-        }
-
-        isProcessingMuteChange = true
-        defer { isProcessingMuteChange = false }
-
-        // Apply system-wide mute via AppleScript
-        if muted {
+        if newState {
             let current = getSystemInputVolume()
             if current > 5 {
                 savedInputVolume = current
@@ -224,18 +42,11 @@ final class AirPodsMuteService {
             logger.info("🔊 Mic unmuted (restored volume: \(self.savedInputVolume))")
         }
 
-        // Sync with AVAudioApplication (only if handler registered)
-        if hasRegisteredHandler {
-            do {
-                try AVAudioApplication.shared.setInputMuted(muted)
-            } catch {
-                logger.warning("setInputMuted failed: \(error.localizedDescription)")
-            }
-        }
-
-        isMuted = muted
-        onMuteStateChanged?(muted)
+        isMuted = newState
+        onMuteStateChanged?(newState)
     }
+
+    // MARK: - AppleScript Helpers
 
     /// Gets the current system input volume (0–100)
     private func getSystemInputVolume() -> Int {

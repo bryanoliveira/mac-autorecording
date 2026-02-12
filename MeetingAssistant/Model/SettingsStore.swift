@@ -55,33 +55,6 @@ final class SettingsStore {
 
     // MARK: - Microphone Settings
 
-    /// During-call stem mute: monitors AirPods stem presses during recording
-    var airpodsStemMuteEnabled: Bool {
-        get {
-            access(keyPath: \.airpodsStemMuteEnabled)
-            return UserDefaults.standard.object(forKey: "airpodsStemMuteEnabled") as? Bool ?? false
-        }
-        set {
-            withMutation(keyPath: \.airpodsStemMuteEnabled) {
-                UserDefaults.standard.set(newValue, forKey: "airpodsStemMuteEnabled")
-            }
-        }
-    }
-
-    /// Always-on stem monitoring: keeps a mic tap to detect stem events anytime.
-    /// Mutually exclusive with autoRecordEnabled (the mic tap would trigger auto-record).
-    var alwaysOnStemMonitoring: Bool {
-        get {
-            access(keyPath: \.alwaysOnStemMonitoring)
-            return UserDefaults.standard.object(forKey: "alwaysOnStemMonitoring") as? Bool ?? false
-        }
-        set {
-            withMutation(keyPath: \.alwaysOnStemMonitoring) {
-                UserDefaults.standard.set(newValue, forKey: "alwaysOnStemMonitoring")
-            }
-        }
-    }
-
     /// Keyboard shortcut for mute toggle
     var muteShortcutKeyCode: UInt32 {
         get {

@@ -38,6 +38,14 @@ struct MenuBarDropdownView: View {
             Divider()
                 .padding(.horizontal, 12)
 
+            // Mic controls — always visible
+            micControls
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+
+            Divider()
+                .padding(.horizontal, 12)
+
             // Bottom actions
             bottomActions
                 .padding(.horizontal, 12)
@@ -51,7 +59,6 @@ struct MenuBarDropdownView: View {
     @ViewBuilder
     private var statusHeader: some View {
         HStack(spacing: 10) {
-            // Status indicator
             Circle()
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
@@ -67,6 +74,16 @@ struct MenuBarDropdownView: View {
             }
 
             Spacer()
+
+            // Muted badge in header
+            if viewModel.isMuted {
+                Label("Muted", systemImage: "mic.slash.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(.orange.opacity(0.1), in: Capsule())
+            }
         }
     }
 
@@ -133,25 +150,10 @@ struct MenuBarDropdownView: View {
                     .font(.system(size: 18, weight: .semibold, design: .monospaced))
 
                 Spacer()
-
-                if viewModel.isMuted {
-                    Label("Muted", systemImage: "mic.slash.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.orange)
-                }
             }
             .padding(.vertical, 4)
 
             Divider()
-
-            // Mute/unmute toggle
-            MenuBarActionButton(
-                title: viewModel.isMuted ? "Unmute Microphone" : "Mute Microphone",
-                systemImage: viewModel.isMuted ? "mic.slash.fill" : "mic.fill",
-                accentColor: viewModel.isMuted ? .orange : .blue
-            ) {
-                viewModel.toggleMicMute()
-            }
 
             MenuBarActionButton(
                 title: "Stop & Save",
@@ -195,7 +197,7 @@ struct MenuBarDropdownView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
 
-            // Manual record button — triggers countdown then closes dropdown
+            // Manual record button
             if !viewModel.isInCountdown && !viewModel.isWaitingForContent {
                 MenuBarActionButton(
                     title: "Start Recording",
@@ -203,13 +205,61 @@ struct MenuBarDropdownView: View {
                     accentColor: .red
                 ) {
                     viewModel.startManualRecording()
-                    dismiss()  // Close dropdown so it doesn't cover the popup
+                    dismiss()
                 }
             }
 
             // Permission warnings
             if !viewModel.permissionService.allRequiredPermissionsGranted {
                 permissionWarning
+            }
+        }
+    }
+
+    // MARK: - Mic Controls (Always Visible)
+
+    @ViewBuilder
+    private var micControls: some View {
+        VStack(spacing: 4) {
+            // Mute/Unmute button — always available
+            MenuBarActionButton(
+                title: viewModel.isMuted ? "Unmute Microphone" : "Mute Microphone",
+                systemImage: viewModel.isMuted ? "mic.slash.fill" : "mic.fill",
+                accentColor: viewModel.isMuted ? .orange : .blue
+            ) {
+                viewModel.toggleMicMute()
+            }
+
+            // Shortcut hint
+            if viewModel.settings.muteShortcutEnabled {
+                HStack {
+                    Spacer()
+                    Text(viewModel.settings.muteShortcutDisplayString)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 8)
+            }
+
+            // Always-on stem toggle
+            Toggle(isOn: Bindable(viewModel.settings).alwaysOnStemMonitoring) {
+                HStack(spacing: 8) {
+                    Image(systemName: "airpodspro")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Text("AirPods stem mute")
+                        .font(.system(size: 13))
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .onChange(of: viewModel.settings.alwaysOnStemMonitoring) {
+                if viewModel.settings.alwaysOnStemMonitoring && viewModel.settings.autoRecordEnabled {
+                    viewModel.settings.autoRecordEnabled = false
+                }
+                viewModel.updateStemMonitoring()
             }
         }
     }

@@ -5,10 +5,13 @@
 //  Implements system-wide mic mute via AppleScript and detects
 //  AirPods stem press for mute/unmute.
 //
-//  KEY DESIGN: Like MutePod, stem detection requires a continuously
-//  running AVAudioEngine input tap to maintain an active audio session.
-//  macOS only routes stem press events to apps with active audio sessions.
-//  The tap can start at app launch ("always-on") or only during recording.
+//  KEY INSIGHT: The system only routes stem press events to apps that:
+//  1. Have an active audio input session (AVAudioEngine with input tap)
+//  2. Have registered via setInputMuteStateChangeHandler
+//  3. Keep AVAudioApplication.shared.isInputMuted in sync with the mute state
+//
+//  Without calling setInputMuted(_:), the system doesn't consider
+//  our app as properly handling mute state, and won't route events.
 //
 
 import AVFAudio
@@ -37,9 +40,7 @@ final class AirPodsMuteService {
     // MARK: - Always-On Monitoring
 
     /// Starts continuous mic monitoring for stem detection.
-    /// Call at app launch when the user wants always-on stem support.
-    /// The AVAudioEngine tap keeps the audio session alive so macOS
-    /// routes stem press events to our app (like MutePod does).
+    /// Must start the audio engine FIRST, then register the handler.
     func startAlwaysOnMonitoring() {
         guard !isMonitoring else { return }
         isMonitoring = true
@@ -48,11 +49,19 @@ final class AirPodsMuteService {
         savedInputVolume = getSystemInputVolume()
         if savedInputVolume < 5 { savedInputVolume = 100 }
 
-        // Register stem handler once
-        registerStemHandlerIfNeeded()
-
-        // Start audio engine tap — this is the key
+        // 1. Start audio engine FIRST to establish active audio session
         startAudioEngineTap()
+
+        // 2. Initialize the system mute state tracking
+        do {
+            try AVAudioApplication.shared.setInputMuted(false)
+            logger.info("Initialized isInputMuted = false")
+        } catch {
+            logger.warning("Could not initialize isInputMuted: \(error.localizedDescription)")
+        }
+
+        // 3. Register stem handler AFTER engine is running
+        registerStemHandlerIfNeeded()
 
         logger.info("Always-on stem monitoring started")
     }
@@ -68,6 +77,8 @@ final class AirPodsMuteService {
         if isMuted {
             setSystemInputVolume(savedInputVolume)
             isMuted = false
+            // Sync the system state
+            try? AVAudioApplication.shared.setInputMuted(false)
         }
 
         logger.info("Always-on stem monitoring stopped")
@@ -75,7 +86,7 @@ final class AirPodsMuteService {
 
     // MARK: - Manual Mute Toggle
 
-    /// Toggles mute state — called from the UI mute button
+    /// Toggles mute state — called from the UI mute button or keyboard shortcut
     func toggleMute() {
         applyMuteState(muted: !isMuted)
     }
@@ -87,26 +98,27 @@ final class AirPodsMuteService {
 
         do {
             try AVAudioApplication.shared.setInputMuteStateChangeHandler { [weak self] requestedMute in
-                // This runs on an arbitrary thread — dispatch to MainActor
-                Task { @MainActor [weak self] in
+                // This callback runs on an arbitrary audio thread.
+                // We must dispatch to MainActor for our @MainActor properties,
+                // but return true synchronously to accept the gesture.
+                DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.logger.info("Stem press detected: mute=\(requestedMute)")
+                    self.logger.info("🎧 Stem press detected: mute=\(requestedMute)")
                     self.applyMuteState(muted: requestedMute)
                 }
-                return true  // Accept the mute gesture
+                return true  // Accept the mute gesture immediately
             }
             hasRegisteredHandler = true
-            logger.info("Stem press handler registered")
+            logger.info("✅ Stem press handler registered successfully")
         } catch {
-            logger.error("Failed to register stem handler: \(error.localizedDescription)")
+            logger.error("❌ Failed to register stem handler: \(error.localizedDescription)")
         }
     }
 
     // MARK: - Audio Engine Tap
 
-    /// Starts a silent AVAudioEngine input tap to keep our audio session active.
-    /// This is analogous to what MutePod does — without an active audio session,
-    /// macOS won't route AirPods stem events to our app.
+    /// Starts a silent AVAudioEngine input tap to maintain an active audio session.
+    /// This is what makes macOS route stem events to our app.
     private func startAudioEngineTap() {
         guard audioEngine == nil else { return }
 
@@ -119,13 +131,13 @@ final class AirPodsMuteService {
             return
         }
 
-        // Silent tap — we discard all audio data
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { _, _ in }
+        // Silent tap — discard all audio data, but keep the session alive
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { _, _ in }
 
         do {
             try engine.start()
             audioEngine = engine
-            logger.info("Audio engine tap started (format: \(format.sampleRate)Hz, \(format.channelCount)ch)")
+            logger.info("Audio engine tap started (\(format.sampleRate)Hz, \(format.channelCount)ch)")
         } catch {
             logger.error("Failed to start audio engine: \(error.localizedDescription)")
         }
@@ -140,7 +152,7 @@ final class AirPodsMuteService {
         }
     }
 
-    // MARK: - Mute Implementation (AppleScript)
+    // MARK: - Mute Implementation
 
     private func applyMuteState(muted: Bool) {
         if muted {
@@ -155,11 +167,19 @@ final class AirPodsMuteService {
             logger.info("Mic unmuted (restored volume: \(self.savedInputVolume))")
         }
 
+        // CRITICAL: Sync with AVAudioApplication so the system knows our mute state.
+        // Without this, stem events won't be routed to our handler on subsequent presses.
+        do {
+            try AVAudioApplication.shared.setInputMuted(muted)
+        } catch {
+            logger.warning("Could not sync isInputMuted: \(error.localizedDescription)")
+        }
+
         isMuted = muted
         onMuteStateChanged?(muted)
     }
 
-    /// Gets the current system input volume (0–100)
+    /// Gets the current system input volume (0–100) via AppleScript
     private func getSystemInputVolume() -> Int {
         let script = NSAppleScript(source: "input volume of (get volume settings)")
         var error: NSDictionary?
@@ -170,7 +190,7 @@ final class AirPodsMuteService {
         return 100
     }
 
-    /// Sets the system input volume (0–100)
+    /// Sets the system input volume (0–100) via AppleScript
     private func setSystemInputVolume(_ volume: Int) {
         let clamped = max(0, min(100, volume))
         let script = NSAppleScript(source: "set volume input volume \(clamped)")

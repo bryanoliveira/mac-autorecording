@@ -5,13 +5,12 @@
 //  Implements system-wide mic mute via AppleScript and detects
 //  AirPods stem press for mute/unmute.
 //
-//  KEY INSIGHT: The system routes stem press events to apps that:
-//  1. Have an active audio input session (AVAudioEngine with input tap)
-//  2. Have registered via setInputMuteStateChangeHandler
-//
-//  GOTCHA: Calling setInputMuted(_:) triggers the handler, so we must
-//  guard against re-entrant loops. We use isProcessingMuteChange to
-//  break the cycle: handler → applyMuteState → setInputMuted → handler.
+//  STEM DETECTION ON macOS:
+//  AVAudioSession is iOS-only. On macOS, the equivalent of
+//  configuring a voiceChat audio session is enabling voice
+//  processing on AVAudioEngine's input node. This tells
+//  the audio system that our app is a communication app,
+//  making macOS route AirPods stem events to our handler.
 //
 
 import AVFAudio
@@ -41,27 +40,22 @@ final class AirPodsMuteService {
 
     // MARK: - Always-On Monitoring
 
-    /// Starts continuous mic monitoring for stem detection.
     func startAlwaysOnMonitoring() {
         guard !isMonitoring else { return }
         isMonitoring = true
 
-        // Capture current volume
         savedInputVolume = getSystemInputVolume()
         if savedInputVolume < 5 { savedInputVolume = 100 }
 
-        // 1. Start audio engine FIRST to establish active audio session
+        // 1. Start audio engine with voice processing enabled
         startAudioEngineTap()
 
-        // 2. Register stem handler AFTER engine is running
-        //    Do NOT call setInputMuted here — it triggers the handler
-        //    and causes an infinite loop before any real stem press.
+        // 2. Register stem handler after engine is running
         registerStemHandlerIfNeeded()
 
         logger.info("Always-on stem monitoring started")
     }
 
-    /// Stops continuous monitoring
     func stopAlwaysOnMonitoring() {
         guard isMonitoring else { return }
         isMonitoring = false
@@ -79,7 +73,6 @@ final class AirPodsMuteService {
 
     // MARK: - Manual Mute Toggle
 
-    /// Toggles mute state — called from the UI mute button or keyboard shortcut
     func toggleMute() {
         applyMuteState(muted: !isMuted, fromStemHandler: false)
     }
@@ -91,9 +84,6 @@ final class AirPodsMuteService {
 
         do {
             try AVAudioApplication.shared.setInputMuteStateChangeHandler { [weak self] requestedMute in
-                // This callback runs on an arbitrary audio thread.
-                // Return true synchronously to accept the gesture,
-                // then dispatch the actual mute logic to MainActor.
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.logger.info("🎧 Stem handler fired: mute=\(requestedMute)")
@@ -110,10 +100,27 @@ final class AirPodsMuteService {
 
     // MARK: - Audio Engine Tap
 
+    /// Starts AVAudioEngine with voice processing enabled on the input node.
+    /// Voice processing (kAudioUnitSubType_VoiceProcessingIO) is the macOS
+    /// equivalent of AVAudioSession's .voiceChat mode — it tells macOS
+    /// that this app is a communication app, enabling stem event routing.
     private func startAudioEngineTap() {
         guard audioEngine == nil else { return }
 
         let engine = AVAudioEngine()
+
+        // Enable voice processing BEFORE accessing inputNode format.
+        // This switches the audio unit from RemoteIO to VoiceProcessingIO,
+        // which is what makes macOS route AirPods stem events to us.
+        do {
+            try engine.inputNode.setVoiceProcessingEnabled(true)
+            logger.info("✅ Voice processing enabled on input node")
+        } catch {
+            logger.error("❌ Failed to enable voice processing: \(error.localizedDescription)")
+            // Continue anyway — stem detection may not work but at least
+            // the engine tap will keep a mic session alive
+        }
+
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
 
@@ -122,7 +129,7 @@ final class AirPodsMuteService {
             return
         }
 
-        // Silent tap — discard audio, but keep the session alive
+        // Silent tap — discard audio, keep session alive
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { _, _ in }
 
         do {
@@ -145,18 +152,14 @@ final class AirPodsMuteService {
 
     // MARK: - Mute Implementation
 
-    /// Applies the mute state. Guards against re-entrant calls from the handler loop.
-    ///
-    /// The loop happens because: handler fires → applyMuteState → setInputMuted → handler fires again.
-    /// We break this with isProcessingMuteChange and by checking isMuted != muted.
     private func applyMuteState(muted: Bool, fromStemHandler: Bool) {
-        // Guard 1: prevent re-entrant loops
+        // Guard: prevent re-entrant loops
         guard !isProcessingMuteChange else {
             logger.debug("Skipping re-entrant mute change")
             return
         }
 
-        // Guard 2: no-op if state already matches
+        // Guard: no-op if state already matches
         guard isMuted != muted else {
             logger.debug("Mute state already \(muted) — skipping")
             return
@@ -178,8 +181,7 @@ final class AirPodsMuteService {
             logger.info("🔊 Mic unmuted (restored volume: \(self.savedInputVolume))")
         }
 
-        // Sync with AVAudioApplication so the system tracks our mute state.
-        // Only call if handler is registered (required by the API).
+        // Sync with AVAudioApplication (only if handler registered)
         if hasRegisteredHandler {
             do {
                 try AVAudioApplication.shared.setInputMuted(muted)

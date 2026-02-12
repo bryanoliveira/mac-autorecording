@@ -109,35 +109,60 @@ final class AirPodsMuteService {
 
         let engine = AVAudioEngine()
 
-        // Enable voice processing BEFORE accessing inputNode format.
-        // This switches the audio unit from RemoteIO to VoiceProcessingIO,
-        // which is what makes macOS route AirPods stem events to us.
+        // 1. Enable voice processing (switches audio unit type to VP I/O)
         do {
             try engine.inputNode.setVoiceProcessingEnabled(true)
             logger.info("✅ Voice processing enabled on input node")
         } catch {
             logger.error("❌ Failed to enable voice processing: \(error.localizedDescription)")
-            // Continue anyway — stem detection may not work but at least
-            // the engine tap will keep a mic session alive
         }
 
         let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+        let outputNode = engine.outputNode
+        
+        // Fetch explicit formats to detect mismatch
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        let outputFormat = outputNode.outputFormat(forBus: 0)
 
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            logger.warning("Invalid audio format — cannot start engine tap")
+        logger.info("Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount)ch")
+        logger.info("Output format: \(outputFormat.sampleRate)Hz, \(outputFormat.channelCount)ch")
+
+        guard inputFormat.sampleRate > 0, outputFormat.sampleRate > 0 else {
+            logger.warning("Invalid audio formats — cannot start engine")
             return
         }
+        
+        if inputFormat.sampleRate != outputFormat.sampleRate {
+            logger.warning("⚠️ Sample rate mismatch! VoiceProcessingIO requires valid input/output combinations. Engine start might fail.")
+        }
 
-        // Silent tap — discard audio, keep session alive
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { _, _ in }
+        // 2. Install silent input tap (Uplink)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { _, _ in }
+
+        // 3. Connect Mixer to Output (Downlink) with EXPLICIT output format
+        // This is critical to satisfy VoiceProcessingIO's full-duplex requirement
+        // and matching the hardware sample rate on the output side.
+        engine.connect(engine.mainMixerNode, to: outputNode, format: outputFormat)
+        engine.mainMixerNode.outputVolume = 0
 
         do {
+            engine.prepare()
             try engine.start()
             audioEngine = engine
-            logger.info("Audio engine tap started (\(format.sampleRate)Hz, \(format.channelCount)ch)")
+            logger.info("Audio engine started (VoiceProcessingIO active)")
         } catch {
-            logger.error("Failed to start audio engine: \(error.localizedDescription)")
+            logger.error("❌ Engine start failed: \(error.localizedDescription)")
+            
+            // Fallback: Try disabling VP to restore basic functionality
+            do {
+                logger.info("Retrying without Voice Processing...")
+                try engine.inputNode.setVoiceProcessingEnabled(false)
+                try engine.start()
+                audioEngine = engine
+                logger.info("✅ Audio engine started (Standard mode - No Stem Detection)")
+            } catch {
+                logger.error("❌ Fallback failed: \(error.localizedDescription)")
+            }
         }
     }
 

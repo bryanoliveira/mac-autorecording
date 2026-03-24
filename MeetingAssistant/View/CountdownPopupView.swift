@@ -4,7 +4,7 @@
 //
 //  Floating popup that appears when mic activity is detected.
 //  Shows a countdown, and lets the user dismiss, start immediately,
-//  or switch to video recording mode.
+//  switch to video recording mode, or pause/resume during recording.
 //
 
 import SwiftUI
@@ -12,6 +12,7 @@ import SwiftUI
 struct CountdownPopupView: View {
 
     let viewModel: MeetingRecorderViewModel
+    @State private var showingDiscardAlert = false
 
     var body: some View {
         VStack(spacing: 16) {
@@ -22,7 +23,7 @@ struct CountdownPopupView: View {
                 countdownContent
             } else if viewModel.isWaitingForContent {
                 waitingContent
-            } else if viewModel.isRecording {
+            } else if viewModel.isRecordingOrPaused {
                 recordingContent
             }
         }
@@ -45,21 +46,23 @@ struct CountdownPopupView: View {
 
             Spacer()
 
-            if viewModel.isMuted {
-                Image(systemName: "mic.slash.fill")
-                    .foregroundStyle(.orange)
+            if viewModel.isPaused {
+                Image(systemName: "pause.fill")
+                    .foregroundStyle(.yellow)
                     .font(.system(size: 12))
             }
         }
     }
 
     private var statusColor: Color {
+        if viewModel.isPaused { return .yellow }
         if viewModel.isRecording { return .red }
         if viewModel.isWaitingForContent { return .blue }
         return .orange
     }
 
     private var statusTitle: String {
+        if viewModel.isPaused { return "Paused" }
         if viewModel.isRecording { return "Recording" }
         if viewModel.isWaitingForContent { return "Waiting for Content Selection" }
         return "Mic Activity Detected"
@@ -136,9 +139,9 @@ struct CountdownPopupView: View {
                 Spacer()
 
                 HStack(spacing: 4) {
-                    Image(systemName: viewModel.isVideoMode ? "video.fill" : "waveform")
+                    Image(systemName: viewModel.isPaused ? "pause.fill" : (viewModel.isVideoMode ? "video.fill" : "waveform"))
                         .font(.system(size: 11))
-                    Text(viewModel.isVideoMode ? "Video" : "Audio")
+                    Text(viewModel.isPaused ? "Paused" : (viewModel.isVideoMode ? "Video" : "Audio"))
                         .font(.system(size: 11, weight: .medium))
                 }
                 .foregroundStyle(.secondary)
@@ -147,29 +150,67 @@ struct CountdownPopupView: View {
                 .background(.quaternary, in: .capsule)
             }
 
-            HStack(spacing: 10) {
-                Button(role: .destructive) {
-                    Task {
-                        await viewModel.discardRecording()
+            if showingDiscardAlert {
+                VStack(spacing: 12) {
+                    Text("Discard this recording?")
+                        .font(.system(size: 13, weight: .medium))
+                    
+                    HStack(spacing: 10) {
+                        Button("Cancel") {
+                            withAnimation { showingDiscardAlert = false }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        
+                        Spacer()
+                        
+                        Button(role: .destructive) {
+                            showingDiscardAlert = false
+                            Task { await viewModel.discardRecording() }
+                        } label: {
+                            Label("Discard", systemImage: "trash")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .controlSize(.regular)
                     }
-                } label: {
-                    Label("Discard", systemImage: "trash")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
-
-                Spacer()
-
-                Button {
-                    Task {
-                        await viewModel.stopRecording()
+                .padding(.top, 4)
+            } else {
+                HStack(spacing: 10) {
+                    Button(role: .destructive) {
+                        withAnimation { showingDiscardAlert = true }
+                    } label: {
+                        Label("Discard", systemImage: "trash")
                     }
-                } label: {
-                    Label("Stop & Save", systemImage: "stop.fill")
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+
+                    // Pause / Resume
+                    Button {
+                        viewModel.togglePauseResume()
+                    } label: {
+                        Label(
+                            viewModel.isPaused ? "Resume" : "Pause",
+                            systemImage: viewModel.isPaused ? "play.fill" : "pause.fill"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+
+                    Spacer()
+
+                    Button {
+                        Task {
+                            await viewModel.stopRecording()
+                        }
+                    } label: {
+                        Label("Stop & Save", systemImage: "stop.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .controlSize(.regular)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-                .controlSize(.regular)
             }
         }
     }

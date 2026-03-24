@@ -36,12 +36,12 @@ final class AudioAssetWriter: RecordingEngineSampleBufferDelegate, @unchecked Se
 
     private let lock = OSAllocatedUnfairLock()
 
-    /// When true, mic samples are silenced (zero-filled) in the recording.
-    /// Set by the ViewModel when the user mutes via UI or AirPods stem.
-    private let _isMicMuted = OSAllocatedUnfairLock(initialState: false)
-    var isMicMuted: Bool {
-        get { _isMicMuted.withLock { $0 } }
-        set { _isMicMuted.withLock { $0 = newValue } }
+    /// When true, incoming samples are dropped (recording is paused).
+    /// Set by the ViewModel when the user pauses the recording.
+    private let _isPaused = OSAllocatedUnfairLock(initialState: false)
+    var isPaused: Bool {
+        get { _isPaused.withLock { $0 } }
+        set { _isPaused.withLock { $0 = newValue } }
     }
 
     // MARK: - Setup
@@ -157,6 +157,7 @@ final class AudioAssetWriter: RecordingEngineSampleBufferDelegate, @unchecked Se
     // MARK: - Sample Buffer Appending
 
     func appendAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        guard !isPaused else { return }
         lock.withLockUnchecked {
             guard let assetWriter,
                   assetWriter.status == .writing,
@@ -173,6 +174,7 @@ final class AudioAssetWriter: RecordingEngineSampleBufferDelegate, @unchecked Se
     }
 
     func appendMicrophoneSample(_ sampleBuffer: CMSampleBuffer) {
+        guard !isPaused else { return }
         lock.withLockUnchecked {
             guard let assetWriter,
                   assetWriter.status == .writing,
@@ -182,21 +184,14 @@ final class AudioAssetWriter: RecordingEngineSampleBufferDelegate, @unchecked Se
             let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             startSessionIfNeeded(at: time, writer: assetWriter)
 
-            // When muted, write a silent copy of the buffer instead of the real audio.
-            // This keeps timestamps correct while producing silence.
-            if isMicMuted {
-                if let silentBuffer = createSilentCopy(of: sampleBuffer) {
-                    microphoneInput.append(silentBuffer)
-                }
-            } else {
-                if !microphoneInput.append(sampleBuffer) {
-                    logger.error("Failed to append microphone sample")
-                }
+            if !microphoneInput.append(sampleBuffer) {
+                logger.error("Failed to append microphone sample")
             }
         }
     }
 
     func appendVideoSample(_ sampleBuffer: CMSampleBuffer) {
+        guard !isPaused else { return }
         // Check frame status
         guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
               let attachments = attachmentsArray.first,
@@ -360,74 +355,6 @@ final class AudioAssetWriter: RecordingEngineSampleBufferDelegate, @unchecked Se
         }
     }
 
-    /// Creates a silence-filled copy of an audio sample buffer (preserves timing)
-    private func createSilentCopy(of sampleBuffer: CMSampleBuffer) -> CMSampleBuffer? {
-        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-            return nil
-        }
-
-        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
-        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let duration = CMSampleBufferGetDuration(sampleBuffer)
-
-        // Get the total size needed
-        var totalSize: Int = 0
-        CMSampleBufferGetSampleSizeArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: nil)
-
-        if let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
-            totalSize = CMBlockBufferGetDataLength(dataBuffer)
-        } else {
-            // Fallback: estimate from format
-            let bytesPerSample = 2 // 16-bit PCM
-            totalSize = numSamples * bytesPerSample
-        }
-
-        guard totalSize > 0 else { return nil }
-
-        // Create a zero-filled block buffer
-        var blockBuffer: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: totalSize,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: totalSize,
-            flags: kCMBlockBufferAssureMemoryNowFlag,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr, let blockBuffer else { return nil }
-
-        // Fill with zeros (silence)
-        status = CMBlockBufferFillDataBytes(with: 0, blockBuffer: blockBuffer, offsetIntoDestination: 0, dataLength: totalSize)
-        guard status == noErr else { return nil }
-
-        // Build a new sample buffer with the silent data
-        var silentBuffer: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(
-            duration: duration,
-            presentationTimeStamp: presentationTime,
-            decodeTimeStamp: .invalid
-        )
-
-        status = CMSampleBufferCreate(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: blockBuffer,
-            dataReady: true,
-            makeDataReadyCallback: nil,
-            refcon: nil,
-            formatDescription: formatDescription,
-            sampleCount: numSamples,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 0,
-            sampleSizeArray: nil,
-            sampleBufferOut: &silentBuffer
-        )
-
-        return status == noErr ? silentBuffer : nil
-    }
 }
 
 // MARK: - Errors

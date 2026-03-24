@@ -4,7 +4,7 @@
 //
 //  Central view model orchestrating all services.
 //  Implements the auto-recording flow:
-//    mic active → countdown → record → mic inactive → stop → rename
+//    mic active → countdown → record → manual stop → rename
 //
 
 import Foundation
@@ -24,6 +24,7 @@ final class MeetingRecorderViewModel {
         case countdown(remaining: Int)
         case waitingForContentSelection
         case recording
+        case paused
         case stopping
     }
 
@@ -35,6 +36,8 @@ final class MeetingRecorderViewModel {
     private(set) var isVideoMode = false
 
     var isRecording: Bool { state == .recording }
+    var isPaused: Bool { state == .paused }
+    var isRecordingOrPaused: Bool { state == .recording || state == .paused }
     var isInCountdown: Bool {
         if case .countdown = state { return true }
         return false
@@ -63,14 +66,13 @@ final class MeetingRecorderViewModel {
     let settings: SettingsStore
     let permissionService: PermissionService
     let calendarService: CalendarService
-    let airPodsMuteService: AirPodsMuteService
+    let micVolumeEnforcer: MicVolumeEnforcer
     private let micMonitorService: MicMonitorService
     private let recordingEngine: RecordingEngine
     private let assetWriter: AudioAssetWriter
     private let globalHotkeyService: GlobalHotkeyService
 
     var isMicInUse: Bool { micMonitorService.isMicInUse }
-    var isMuted: Bool { airPodsMuteService.isMuted }
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "MeetingAssistant", category: "MeetingRecorderViewModel")
 
@@ -79,6 +81,8 @@ final class MeetingRecorderViewModel {
     private var recordingTimer: Timer?
     private var recordingStartTime: Date?
     private var recordingStartDate: Date?
+    /// Accumulated duration before the current timer segment (for pause/resume)
+    private var accumulatedDuration: TimeInterval = 0
     private var countdownTimer: Timer?
     private var pendingVideoMode = false
     private var isManualTrigger = false
@@ -91,7 +95,7 @@ final class MeetingRecorderViewModel {
         self.settings = SettingsStore()
         self.permissionService = PermissionService()
         self.calendarService = CalendarService()
-        self.airPodsMuteService = AirPodsMuteService()
+        self.micVolumeEnforcer = MicVolumeEnforcer()
         self.micMonitorService = MicMonitorService()
         self.recordingEngine = RecordingEngine()
         self.assetWriter = AudioAssetWriter()
@@ -101,7 +105,6 @@ final class MeetingRecorderViewModel {
         recordingEngine.sampleBufferDelegate = assetWriter
 
         setupMicMonitorCallbacks()
-        setupMuteCallback()
         setupGlobalHotkey()
     }
 
@@ -110,13 +113,6 @@ final class MeetingRecorderViewModel {
     func setPopupCallbacks(show: @escaping () -> Void, hide: @escaping () -> Void) {
         showPopupCallback = show
         hidePopupCallback = hide
-    }
-
-    private func setupMuteCallback() {
-        airPodsMuteService.onMuteStateChanged = { [weak self] isMuted in
-            // Sync mute state to the asset writer so the recording is also silenced
-            self?.assetWriter.isMicMuted = isMuted
-        }
     }
 
     private func setupMicMonitorCallbacks() {
@@ -130,19 +126,18 @@ final class MeetingRecorderViewModel {
             self.startCountdown()
         }
 
+        // Mic becoming inactive no longer stops recording.
+        // The user stops recording manually or via the UI.
         micMonitorService.onMicBecameInactive = { [weak self] in
             guard let self else { return }
 
             if self.isInCountdown && !self.isManualTrigger {
                 // Mic went inactive during auto-triggered countdown — cancel
                 self.cancelCountdown()
-            } else if self.isRecording {
-                // Mic went inactive during recording — stop
-                self.logger.info("Mic became inactive — stopping recording")
-                Task { [weak self] in
-                    await self?.stopRecording()
-                }
             }
+            // NOTE: We intentionally do NOT stop a recording when the mic
+            // goes inactive. This allows switching mics/headphones mid-meeting
+            // without breaking the recording.
         }
     }
 
@@ -172,8 +167,6 @@ final class MeetingRecorderViewModel {
         globalHotkeyService.unregister()
     }
 
-
-
     /// Call when keyboard shortcut settings change
     func updateGlobalHotkey() {
         globalHotkeyService.unregister()
@@ -187,7 +180,7 @@ final class MeetingRecorderViewModel {
 
     private func setupGlobalHotkey() {
         globalHotkeyService.onHotkeyPressed = { [weak self] in
-            self?.toggleMicMute()
+            self?.togglePauseResume()
         }
     }
 
@@ -304,6 +297,9 @@ final class MeetingRecorderViewModel {
             // Start duration timer
             startTimer()
 
+            // Enforce mic volume at 100%
+            micVolumeEnforcer.startEnforcingVolume()
+
             // Hide popup after recording starts
             hidePopupCallback?()
 
@@ -317,10 +313,11 @@ final class MeetingRecorderViewModel {
     }
 
     func stopRecording() async {
-        guard isRecording else { return }
+        guard isRecordingOrPaused else { return }
 
         state = .stopping
         stopTimer()
+        micVolumeEnforcer.stopEnforcingVolume()
 
         do {
             try await recordingEngine.stopCapture()
@@ -328,6 +325,7 @@ final class MeetingRecorderViewModel {
 
             state = .idle
             recordingDuration = 0
+            accumulatedDuration = 0
             isManualTrigger = false
 
             // Rename based on calendar event
@@ -349,10 +347,11 @@ final class MeetingRecorderViewModel {
 
     /// Discards the current recording (from popup or menu bar)
     func discardRecording() async {
-        guard isRecording else { return }
+        guard isRecordingOrPaused else { return }
 
         state = .stopping
         stopTimer()
+        micVolumeEnforcer.stopEnforcingVolume()
 
         do {
             try await recordingEngine.stopCapture()
@@ -363,6 +362,7 @@ final class MeetingRecorderViewModel {
         assetWriter.cancel()
         state = .idle
         recordingDuration = 0
+        accumulatedDuration = 0
         recordingStartDate = nil
         isManualTrigger = false
         hidePopupCallback?()
@@ -370,16 +370,55 @@ final class MeetingRecorderViewModel {
         logger.info("Recording discarded")
     }
 
+    // MARK: - Pause / Resume
+
+    /// Toggles pause/resume if currently recording or paused
+    func togglePauseResume() {
+        if isRecording {
+            pauseRecording()
+        } else if isPaused {
+            resumeRecording()
+        }
+    }
+
+    /// Pauses the recording — capture continues but samples are dropped
+    func pauseRecording() {
+        guard isRecording else { return }
+
+        // Accumulate elapsed time from the current segment
+        if let startTime = recordingStartTime {
+            accumulatedDuration += Date().timeIntervalSince(startTime)
+        }
+        stopTimer()
+
+        state = .paused
+        assetWriter.isPaused = true
+
+        logger.info("Recording paused at \(self.formattedDuration)")
+    }
+
+    /// Resumes the recording after a pause
+    func resumeRecording() {
+        guard isPaused else { return }
+
+        state = .recording
+        assetWriter.isPaused = false
+
+        // Restart the timer from now, keeping the accumulated duration
+        startTimer()
+
+        logger.info("Recording resumed")
+    }
+
     // MARK: - Timer
 
     private func startTimer() {
         recordingStartTime = Date()
-        recordingDuration = 0
 
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, let startTime = self.recordingStartTime else { return }
-                self.recordingDuration = Date().timeIntervalSince(startTime)
+                self.recordingDuration = self.accumulatedDuration + Date().timeIntervalSince(startTime)
             }
         }
     }
@@ -399,11 +438,6 @@ final class MeetingRecorderViewModel {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: dir.path())
     }
-
-    /// Toggles mic mute state (from UI button)
-    func toggleMicMute() {
-        airPodsMuteService.toggleMute()
-    }
 }
 
 // MARK: - RecordingEngineDelegate
@@ -411,7 +445,7 @@ final class MeetingRecorderViewModel {
 extension MeetingRecorderViewModel: RecordingEngineDelegate {
 
     func recordingEngine(_ engine: RecordingEngine, didStopWithError error: Error?) {
-        if isRecording {
+        if isRecordingOrPaused {
             logger.error("Recording stopped unexpectedly: \(error?.localizedDescription ?? "unknown")")
             Task {
                 await stopRecording()

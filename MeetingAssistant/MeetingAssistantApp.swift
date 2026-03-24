@@ -58,21 +58,16 @@ struct MenuBarLabel: View {
 
     var body: some View {
         Group {
-            if viewModel.isRecording && viewModel.isMuted {
-                // Recording + Muted
-                Image(systemName: "mic.slash.circle.fill")
+            if viewModel.isPaused {
+                // Recording paused
+                Image(systemName: "pause.circle.fill")
                     .symbolRenderingMode(.palette)
-                    .foregroundStyle(.orange, .red)
+                    .foregroundStyle(.yellow, .primary)
             } else if viewModel.isRecording {
                 // Recording (mic active)
                 Image(systemName: "record.circle.fill")
                     .symbolRenderingMode(.palette)
                     .foregroundStyle(.red, .primary)
-            } else if viewModel.isMuted {
-                // Not recording, mic muted
-                Image(systemName: "mic.slash.circle")
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(.orange, .primary)
             } else if viewModel.isInCountdown {
                 // Countdown
                 Image(systemName: "timer")

@@ -140,7 +140,7 @@ struct MicrophoneSettingsView: View {
     var body: some View {
         Form {
             Section("Keyboard Shortcut") {
-                Toggle("Enable mute/unmute shortcut", isOn: $settings.muteShortcutEnabled)
+                Toggle("Enable pause/resume shortcut", isOn: $settings.muteShortcutEnabled)
                     .onChange(of: settings.muteShortcutEnabled) {
                         viewModel.updateGlobalHotkey()
                     }
@@ -176,7 +176,7 @@ struct MicrophoneSettingsView: View {
                         )
                     )
 
-                    Text("Works globally regardless of which app is focused.")
+                    Text("Pauses and resumes the current recording. Works globally regardless of which app is focused.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }

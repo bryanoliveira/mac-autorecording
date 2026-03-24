@@ -12,6 +12,7 @@ struct MenuBarDropdownView: View {
 
     let viewModel: MeetingRecorderViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var showingDiscardAlert = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,7 +27,7 @@ struct MenuBarDropdownView: View {
 
             // Main content based on state
             Group {
-                if viewModel.isRecording {
+                if viewModel.isRecordingOrPaused {
                     recordingControls
                 } else {
                     idleContent
@@ -34,14 +35,6 @@ struct MenuBarDropdownView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-
-            Divider()
-                .padding(.horizontal, 12)
-
-            // Mic controls — always visible
-            micControls
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
 
             Divider()
                 .padding(.horizontal, 12)
@@ -75,14 +68,14 @@ struct MenuBarDropdownView: View {
 
             Spacer()
 
-            // Muted badge in header
-            if viewModel.isMuted {
-                Label("Muted", systemImage: "mic.slash.fill")
+            // Paused badge in header
+            if viewModel.isPaused {
+                Label("Paused", systemImage: "pause.fill")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.yellow)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(.orange.opacity(0.1), in: Capsule())
+                    .background(.yellow.opacity(0.1), in: Capsule())
             }
         }
     }
@@ -97,6 +90,8 @@ struct MenuBarDropdownView: View {
             return .blue
         case .recording:
             return .red
+        case .paused:
+            return .yellow
         case .stopping:
             return .yellow
         }
@@ -112,6 +107,8 @@ struct MenuBarDropdownView: View {
             return "Selecting Content..."
         case .recording:
             return "Recording"
+        case .paused:
+            return "Paused"
         case .stopping:
             return "Saving..."
         }
@@ -131,6 +128,8 @@ struct MenuBarDropdownView: View {
         case .recording:
             let mode = viewModel.isVideoMode ? "Video + Audio" : "Audio only"
             return "\(viewModel.formattedDuration) • \(mode)"
+        case .paused:
+            return "\(viewModel.formattedDuration) • Paused"
         case .stopping:
             return "Finalizing recording..."
         }
@@ -143,8 +142,8 @@ struct MenuBarDropdownView: View {
         VStack(spacing: 6) {
             // Duration display
             HStack {
-                Image(systemName: "record.circle.fill")
-                    .foregroundStyle(.red)
+                Image(systemName: viewModel.isPaused ? "pause.circle.fill" : "record.circle.fill")
+                    .foregroundStyle(viewModel.isPaused ? .yellow : .red)
 
                 Text(viewModel.formattedDuration)
                     .font(.system(size: 18, weight: .semibold, design: .monospaced))
@@ -154,6 +153,15 @@ struct MenuBarDropdownView: View {
             .padding(.vertical, 4)
 
             Divider()
+
+            // Pause / Resume
+            MenuBarActionButton(
+                title: viewModel.isPaused ? "Resume Recording" : "Pause Recording",
+                systemImage: viewModel.isPaused ? "play.fill" : "pause.fill",
+                accentColor: viewModel.isPaused ? .green : .orange
+            ) {
+                viewModel.togglePauseResume()
+            }
 
             MenuBarActionButton(
                 title: "Stop & Save",
@@ -165,13 +173,43 @@ struct MenuBarDropdownView: View {
                 }
             }
 
-            MenuBarActionButton(
-                title: "Discard Recording",
-                systemImage: "trash",
-                accentColor: .orange
-            ) {
-                Task {
-                    await viewModel.discardRecording()
+            if showingDiscardAlert {
+                VStack(spacing: 8) {
+                    Text("Discard this recording?")
+                        .font(.system(size: 13, weight: .medium))
+                    HStack(spacing: 12) {
+                        Button("Cancel") {
+                            withAnimation {
+                                showingDiscardAlert = false
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        
+                        Button("Discard") {
+                            showingDiscardAlert = false
+                            Task {
+                                await viewModel.discardRecording()
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
+                .background(Color.primary.opacity(0.05))
+                .cornerRadius(6)
+            } else {
+                MenuBarActionButton(
+                    title: "Discard Recording",
+                    systemImage: "trash",
+                    accentColor: .orange
+                ) {
+                    withAnimation {
+                        showingDiscardAlert = true
+                    }
                 }
             }
         }
@@ -213,35 +251,6 @@ struct MenuBarDropdownView: View {
             // Permission warnings
             if !viewModel.permissionService.allRequiredPermissionsGranted {
                 permissionWarning
-            }
-        }
-    }
-
-    // MARK: - Mic Controls (Always Visible)
-
-    @ViewBuilder
-    private var micControls: some View {
-        VStack(spacing: 4) {
-            // Mute/Unmute button — always available
-            MenuBarActionButton(
-                title: viewModel.isMuted ? "Unmute Microphone" : "Mute Microphone",
-                systemImage: viewModel.isMuted ? "mic.slash.fill" : "mic.fill",
-                accentColor: viewModel.isMuted ? .orange : .blue
-            ) {
-                viewModel.toggleMicMute()
-            }
-
-            // Shortcut hint — aligned with button labels (28px offset = 18px icon + 10px spacing)
-            if viewModel.settings.muteShortcutEnabled {
-                HStack(spacing: 10) {
-                    Spacer()
-                        .frame(width: 18)
-                    Spacer()
-                    Text(viewModel.settings.muteShortcutDisplayString)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 8)
             }
         }
     }

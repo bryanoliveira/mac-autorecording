@@ -10,7 +10,7 @@ All monitoring is **event-driven** — no polling, no timers, no background audi
 |---|---|---|
 | **Mic Monitor** | CoreAudio `AudioObjectPropertyListenerBlock` on `kAudioDevicePropertyDeviceIsRunningSomewhere` | Zero — OS callback only fires on state change |
 | **Default Device Monitor** | CoreAudio listener on `kAudioHardwarePropertyDefaultInputDevice` | Zero — OS callback on device change |
-| **Mute Service** | AppleScript (`set volume input volume N`) on demand | Zero — only runs when user presses mute |
+| **Volume Enforcer** | AppleScript (`set volume input volume 100`) on 3s timer | Zero when idle — only active during recording |
 | **Global Hotkey** | Carbon `RegisterEventHotKey` | Zero — OS callback on keypress |
 | **Recording Timer** | `Timer.scheduledTimer` (1s interval) | Only active during recording |
 
@@ -24,7 +24,7 @@ All monitoring is **event-driven** — no polling, no timers, no background audi
 - **Disk**: None
 
 ### Recording (Audio Only)
-- **CPU**: ~1–3% — ScreenCaptureKit audio capture + AAC encoding (64 kbps mono)
+- **CPU**: ~1–3% — ScreenCaptureKit audio capture + AAC encoding (64 kbps mono) + volume enforcement timer (negligible)
 - **Memory**: ~30–50 MB (audio buffers + asset writer)
 - **Battery**: Low — efficient hardware-accelerated AAC encoding
 - **Disk**: ~0.5 MB/min (AAC 64 kbps mono)
@@ -35,9 +35,15 @@ All monitoring is **event-driven** — no polling, no timers, no background audi
 - **Battery**: Moderate — hardware HEVC encoder is efficient but video capture adds overhead
 - **Disk**: ~4–5 MB/min (HEVC 500 kbps + AAC 64 kbps)
 
-## What Was Removed (v2)
+### Paused
+- **CPU**: ~0.5–1% — capture stream is still active but all samples are dropped (no encoding)
+- **Memory**: ~30–50 MB (buffers remain allocated, no new data written)
+- **Battery**: Low — capture hardware stays warm but no encoding work
+- **Disk**: None (samples are dropped)
 
-The following were removed to reduce resource usage and eliminate CoreAudio log spam:
+## What Was Removed
+
+The following were removed over time to reduce resource usage, eliminate CoreAudio log spam, and improve reliability:
 
 | Removed Component | Previous Cost | Reason |
 |---|---|---|
@@ -45,8 +51,10 @@ The following were removed to reduce resource usage and eliminate CoreAudio log 
 | **VoiceProcessingIO audio unit** | Full-duplex DSP processing (~2–5% CPU) | macOS VP I/O had persistent initialization failures and DSP errors |
 | **AVAudioApplication stem handler** | Registration + callback overhead | Stem events not reliably routed to non-frontmost apps |
 | **Always-on mic monitoring** | Kept mic hardware active, triggered macOS mic indicator | Battery drain + user confusion from persistent mic icon |
+| **Mic mute via AppleScript** | Minor (on-demand AppleScript) | Unreliable — volume would drift, causing false unmuted states |
+| **Auto-stop on mic inactive** | N/A | Caused recordings to split when switching mics/headphones mid-meeting |
 
-**Net effect**: Idle CPU went from ~2–5% (continuous audio engine) to **~0%** (pure event-driven listeners).
+**Current design**: Idle CPU is **~0%** (pure event-driven listeners). Recording relies on ScreenCaptureKit with volume enforcement and manual stop control.
 
 ## Measuring Resource Usage
 

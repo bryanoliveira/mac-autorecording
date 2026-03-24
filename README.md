@@ -9,8 +9,9 @@ A native macOS menu bar app that **automatically records every meeting** by moni
 - **Optional video** — One-click upgrade to screen recording (HEVC 500 kbps, 15 fps) during the countdown popup
 - **Calendar-aware** — Automatically names recordings after matching calendar events
 - **System audio** — Captures both microphone and system audio (meeting participants)
-- **Mic mute** — Mute/unmute via menu bar dropdown or a global keyboard shortcut
-- **AirPods stem mute** — Experimental support for muting via AirPods stem press
+- **Pause/resume** — Pause and resume recordings during meeting breaks via UI or global keyboard shortcut
+- **Volume enforcement** — Automatically keeps mic input at 100% while recording to prevent volume drift
+- **Stable recordings** — Freely switch mics or headphones mid-meeting without breaking the recording
 - **No dock icon** — Lives entirely in the menu bar
 
 ## Requirements
@@ -24,25 +25,28 @@ A native macOS menu bar app that **automatically records every meeting** by moni
 
 ### From Source
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/MeetingAssistant.git
-   cd MeetingAssistant
-   ```
-
-2. Open the project in Xcode:
+1. Clone the repository and open the project:
    ```bash
    open MeetingAssistant.xcodeproj
    ```
 
-3. Build and run (⌘R), or archive and export for distribution (see below).
+2. Build and run (⌘R), or build a release (see below).
 
-### Exporting a Release Build
+### Building a Release
 
-1. In Xcode, select **Product → Archive**
-2. In the Organizer window, select the archive and click **Distribute App**
-3. Choose **Copy App** (or **Direct Distribution** for notarization)
-4. Export the `.app` file to your desired location
+Run the included build script:
+
+```bash
+./build-release.sh
+```
+
+This builds a Release archive and places the `.app` in `build/MeetingAssistant.app`. Launch it with:
+
+```bash
+open build/MeetingAssistant.app
+```
+
+Alternatively, in Xcode: **Product → Archive → Distribute App → Copy App**.
 
 ## Architecture
 
@@ -62,7 +66,7 @@ MeetingAssistant/
     ├── RecordingEngine.swift      # ScreenCaptureKit stream management
     ├── AudioAssetWriter.swift     # AVAssetWriter for media files
     ├── CalendarService.swift      # EventKit calendar matching
-    ├── AirPodsMuteService.swift   # Stem detection + AppleScript mute
+    ├── MicVolumeEnforcer.swift    # Keeps input volume at 100% during recording
     ├── GlobalHotkeyService.swift  # Carbon-based global keyboard shortcut
     └── PermissionService.swift    # Permission status tracking
 ```
@@ -70,12 +74,14 @@ MeetingAssistant/
 ### Recording Flow
 
 ```
-Mic detected → Countdown popup (5s) → Recording starts → Mic goes silent → Recording stops → File renamed
+Mic detected → Countdown popup (5s) → Recording starts → Manual stop → File renamed
                      │                       │
-                     ├─ Dismiss              ├─ Mute/Unmute
+                     ├─ Dismiss              ├─ Pause / Resume
                      ├─ Add Video            ├─ Stop & Save
                      └─ Start Now            └─ Discard
 ```
+
+Recordings are never auto-stopped — switching mics, headphones, or Bluetooth devices mid-meeting will not interrupt the recording. The user stops recordings manually via the menu bar, popup, or by quitting the app.
 
 ## Settings
 
@@ -83,11 +89,10 @@ Mic detected → Countdown popup (5s) → Recording starts → Mic goes silent �
 - **Countdown duration** — 3/5/8/10 seconds before recording starts
 - **Include system audio** — Capture meeting participants' audio
 - **Auto-record on mic activity** — Automatically start when any app uses the mic
+- **Output directory** — Choose where recordings are saved
 
 ### Microphone
-- **Keyboard shortcut** — Configurable global hotkey for mute/unmute (default: ⌃⌥⌘M)
-- **AirPods stem mute** — Experimental during-call stem detection
-- **Always-on mic monitoring** — Continuous mic tap for stem detection (like MutePod)
+- **Keyboard shortcut** — Configurable global hotkey for pause/resume (default: ⌃⌥⌘M)
 
 ### Permissions
 - Status indicators and quick links to System Settings
@@ -96,7 +101,8 @@ Mic detected → Countdown popup (5s) → Recording starts → Mic goes silent �
 
 - **No sandbox** — Distributed outside the App Store for full mic/audio access
 - **ScreenCaptureKit** — Used for both audio-only and video capture
-- **AppleScript mute** — System-wide mic mute via `set volume input volume 0` (most reliable cross-device method)
+- **Volume enforcement** — AppleScript `set volume input volume 100` on a 3-second timer during recording to prevent OS or app-level volume changes
+- **Pause/resume** — Capture stream stays active while paused; samples are silently dropped to create a gap in the recording
 - **Carbon hotkeys** — `RegisterEventHotKey` for true global shortcuts without Accessibility permission
 - **AAC codec** — 64 kbps mono, suitable for speech recognition (Whisper, etc.)
 

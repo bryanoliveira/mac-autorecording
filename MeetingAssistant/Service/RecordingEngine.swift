@@ -80,7 +80,7 @@ final class RecordingEngine: NSObject {
     // MARK: - Audio-Only Capture
 
     /// Starts an audio-only capture (mic + system audio, no video)
-    func startAudioOnlyCapture(includeSystemAudio: Bool) async throws {
+    func startAudioOnlyCapture() async throws {
         guard !isCapturing else {
             throw RecordingError.captureAlreadyRunning
         }
@@ -95,7 +95,7 @@ final class RecordingEngine: NSObject {
         contentFilter = filter
         isVideoEnabled = false
 
-        let config = createAudioOnlyConfiguration(includeSystemAudio: includeSystemAudio)
+        let config = createAudioOnlyConfiguration()
 
         stream = SCStream(filter: filter, configuration: config, delegate: self)
 
@@ -107,15 +107,13 @@ final class RecordingEngine: NSObject {
         // We must add a .screen output to prevent "SCStream output NOT found" errors.
         // The frames are simply discarded (isVideoEnabled = false).
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoSampleQueue)
-        if includeSystemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
-        }
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
         try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: microphoneSampleQueue)
 
         try await stream.startCapture()
         isCapturing = true
 
-        logger.info("Audio-only capture started (systemAudio: \(includeSystemAudio))")
+        logger.info("Audio-only capture started")
     }
 
     // MARK: - Video Capture
@@ -123,7 +121,7 @@ final class RecordingEngine: NSObject {
     /// Starts a video + audio capture with the previously selected content filter
     /// Returns the video size used for the stream configuration
     @discardableResult
-    func startVideoCapture(with filter: SCContentFilter, includeSystemAudio: Bool) async throws -> CGSize {
+    func startVideoCapture(with filter: SCContentFilter) async throws -> CGSize {
         guard !isCapturing else {
             throw RecordingError.captureAlreadyRunning
         }
@@ -132,7 +130,7 @@ final class RecordingEngine: NSObject {
         isVideoEnabled = true
 
         let videoSize = await getContentSize(from: filter)
-        let config = createVideoConfiguration(includeSystemAudio: includeSystemAudio, videoSize: videoSize)
+        let config = createVideoConfiguration(videoSize: videoSize)
 
         stream = SCStream(filter: filter, configuration: config, delegate: self)
 
@@ -141,9 +139,7 @@ final class RecordingEngine: NSObject {
         }
 
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoSampleQueue)
-        if includeSystemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
-        }
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
         try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: microphoneSampleQueue)
 
         try await stream.startCapture()
@@ -167,7 +163,7 @@ final class RecordingEngine: NSObject {
 
     // MARK: - Configuration
 
-    private func createAudioOnlyConfiguration(includeSystemAudio: Bool) -> SCStreamConfiguration {
+    private func createAudioOnlyConfiguration() -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
 
         // Minimum video settings — ScreenCaptureKit requires a display filter.
@@ -176,11 +172,16 @@ final class RecordingEngine: NSObject {
         config.height = 64
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1) // 1 fps minimum
 
-        // Audio settings
-        config.capturesAudio = includeSystemAudio
-        config.sampleRate = 44100
+        // Audio is captured at each stream's native sample rate. Forcing
+        // config.sampleRate only affects system audio and creates a
+        // cross-stream rate mismatch with the mic, so we skip it.
+        //
+        // We DO request mono via channelCount because system audio is
+        // otherwise delivered as non-interleaved stereo, and mixing that
+        // requires special handling. Asking SCK to downmix to mono is
+        // simpler and fine for transcription-quality recordings.
+        config.capturesAudio = true
         config.channelCount = 1
-
         config.captureMicrophone = true
         config.showsCursor = false
         config.captureResolution = .nominal
@@ -188,7 +189,7 @@ final class RecordingEngine: NSObject {
         return config
     }
 
-    private func createVideoConfiguration(includeSystemAudio: Bool, videoSize: CGSize) -> SCStreamConfiguration {
+    private func createVideoConfiguration(videoSize: CGSize) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
 
         config.width = Int(videoSize.width)
@@ -197,10 +198,9 @@ final class RecordingEngine: NSObject {
         config.showsCursor = true
         config.scalesToFit = true  // Scale content to fill the frame — prevents small-in-corner
 
-        config.capturesAudio = includeSystemAudio
-        config.sampleRate = 44100
+        // Audio at native rates, mono; see createAudioOnlyConfiguration.
+        config.capturesAudio = true
         config.channelCount = 1
-
         config.captureMicrophone = true
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.captureResolution = .best  // Use full resolution to match config dimensions

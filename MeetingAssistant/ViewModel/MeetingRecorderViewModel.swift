@@ -4,7 +4,12 @@
 //
 //  Central view model orchestrating all services.
 //  Implements the auto-recording flow:
-//    mic active → countdown → record → manual stop → rename
+//    mic active → countdown → record → manual stop
+//
+//  Recordings are written to a per-recording sidecar directory while
+//  capturing, then mixed into the final user-facing file when stopped.
+//  Sidecar directories left over from a previous crash are surfaced
+//  for manual recovery.
 //
 
 import Foundation
@@ -34,6 +39,14 @@ final class MeetingRecorderViewModel {
     private(set) var recordingDuration: TimeInterval = 0
     private(set) var lastError: Error?
     private(set) var isVideoMode = false
+
+    /// Partial recording directories left over from previous crashes.
+    /// Refreshed on launch and after each recovery action.
+    private(set) var orphanPartials: [PartialRecording] = []
+    /// IDs of partials currently being recovered (so the UI can show progress).
+    private(set) var recoveringPartialIDs: Set<String> = []
+
+    var hasOrphans: Bool { !orphanPartials.isEmpty }
 
     var isRecording: Bool { state == .recording }
     var isPaused: Bool { state == .paused }
@@ -65,11 +78,12 @@ final class MeetingRecorderViewModel {
 
     let settings: SettingsStore
     let permissionService: PermissionService
-    let calendarService: CalendarService
     let micVolumeEnforcer: MicVolumeEnforcer
     private let micMonitorService: MicMonitorService
     private let recordingEngine: RecordingEngine
     private let assetWriter: AudioAssetWriter
+    private let partialStore: PartialRecordingStore
+    private let mixer: RecordingMixer
     private let globalHotkeyService: GlobalHotkeyService
 
     var isMicInUse: Bool { micMonitorService.isMicInUse }
@@ -88,17 +102,19 @@ final class MeetingRecorderViewModel {
     private var isManualTrigger = false
     private var showPopupCallback: (() -> Void)?
     private var hidePopupCallback: (() -> Void)?
+    private var currentPartial: PartialRecording?
 
     // MARK: - Initialization
 
     init() {
         self.settings = SettingsStore()
         self.permissionService = PermissionService()
-        self.calendarService = CalendarService()
         self.micVolumeEnforcer = MicVolumeEnforcer()
         self.micMonitorService = MicMonitorService()
         self.recordingEngine = RecordingEngine()
         self.assetWriter = AudioAssetWriter()
+        self.partialStore = PartialRecordingStore()
+        self.mixer = RecordingMixer()
         self.globalHotkeyService = GlobalHotkeyService()
 
         recordingEngine.delegate = self
@@ -145,7 +161,6 @@ final class MeetingRecorderViewModel {
 
     func requestPermissionsOnLaunch() async {
         await permissionService.requestPermissions()
-        await calendarService.requestAccess()
     }
 
     func startMonitoring() {
@@ -159,6 +174,7 @@ final class MeetingRecorderViewModel {
             )
         }
 
+        refreshOrphans()
         logger.info("Monitoring started")
     }
 
@@ -267,47 +283,52 @@ final class MeetingRecorderViewModel {
             state = .recording
             isVideoMode = withVideo
             lastError = nil
-            recordingStartDate = Date()
+            let startedAt = Date()
+            recordingStartDate = startedAt
 
-            let outputURL = settings.generateTempOutputURL(withVideo: withVideo)
+            let id = PartialRecordingStore.makeID(for: startedAt)
+            let finalOutputURL = settings.generateFinalOutputURL(id: id, withVideo: withVideo)
 
             if withVideo, let filter = recordingEngine.contentFilter {
                 let videoSize = await recordingEngine.getContentSize(from: filter)
-                try assetWriter.setupWithVideo(
-                    url: outputURL,
-                    videoSize: videoSize,
-                    includeSystemAudio: settings.includeSystemAudio
+                let partial = try partialStore.createPartial(
+                    id: id,
+                    in: settings.outputDirectory,
+                    startedAt: startedAt,
+                    withVideo: true,
+                    finalOutputURL: finalOutputURL,
+                    videoSize: videoSize
                 )
+                currentPartial = partial
+                try assetWriter.setupWithVideo(partial: partial, videoSize: videoSize)
                 try assetWriter.startWriting()
-                try await recordingEngine.startVideoCapture(
-                    with: filter,
-                    includeSystemAudio: settings.includeSystemAudio
-                )
+                try await recordingEngine.startVideoCapture(with: filter)
             } else {
-                try assetWriter.setupAudioOnly(
-                    url: outputURL,
-                    includeSystemAudio: settings.includeSystemAudio
+                let partial = try partialStore.createPartial(
+                    id: id,
+                    in: settings.outputDirectory,
+                    startedAt: startedAt,
+                    withVideo: false,
+                    finalOutputURL: finalOutputURL,
+                    videoSize: nil
                 )
+                currentPartial = partial
+                try assetWriter.setupAudioOnly(partial: partial)
                 try assetWriter.startWriting()
-                try await recordingEngine.startAudioOnlyCapture(
-                    includeSystemAudio: settings.includeSystemAudio
-                )
+                try await recordingEngine.startAudioOnlyCapture()
             }
 
-            // Start duration timer
             startTimer()
-
-            // Enforce mic volume at 100%
             micVolumeEnforcer.startEnforcingVolume()
-
-            // Hide popup after recording starts
             hidePopupCallback?()
 
-            logger.info("Recording started (video: \(withVideo))")
+            logger.info("Recording started (id: \(id), video: \(withVideo))")
 
         } catch {
             state = .idle
             lastError = error
+            assetWriter.cancel()
+            currentPartial = nil
             logger.error("Failed to start recording: \(error.localizedDescription)")
         }
     }
@@ -321,27 +342,28 @@ final class MeetingRecorderViewModel {
 
         do {
             try await recordingEngine.stopCapture()
-            let outputURL = try await assetWriter.finishWriting()
+            let partial = try await assetWriter.finishWriting()
+            let outputURL = try await mixer.mix(partial)
+            partialStore.delete(partial)
+            currentPartial = nil
 
             state = .idle
             recordingDuration = 0
             accumulatedDuration = 0
             isManualTrigger = false
-
-            // Rename based on calendar event
-            if let startDate = recordingStartDate {
-                let _ = calendarService.renameRecording(at: outputURL, recordingStartDate: startDate)
-            }
-
             recordingStartDate = nil
 
-            logger.info("Recording saved")
+            logger.info("Recording saved to \(outputURL.lastPathComponent)")
 
         } catch {
             state = .idle
             lastError = error
-            assetWriter.cancel()
-            logger.error("Failed to stop recording: \(error.localizedDescription)")
+            // Don't cancel: the partial files are intact and can be
+            // recovered later. They will appear as orphans on next launch
+            // (and immediately, via refreshOrphans below).
+            currentPartial = nil
+            refreshOrphans()
+            logger.error("Failed to stop/mix recording: \(error.localizedDescription)")
         }
     }
 
@@ -360,6 +382,7 @@ final class MeetingRecorderViewModel {
         }
 
         assetWriter.cancel()
+        currentPartial = nil
         state = .idle
         recordingDuration = 0
         accumulatedDuration = 0
@@ -426,7 +449,50 @@ final class MeetingRecorderViewModel {
     private func stopTimer() {
         recordingTimer?.invalidate()
         recordingTimer = nil
-        recordingStartTime = nil
+    }
+
+    // MARK: - Orphan Recovery
+
+    /// Refreshes the list of orphan partial recordings, excluding any
+    /// recording currently in progress.
+    func refreshOrphans() {
+        let activeID = currentPartial?.id
+        orphanPartials = partialStore
+            .listOrphans(in: settings.outputDirectory)
+            .filter { $0.id != activeID }
+    }
+
+    /// Mixes a single orphan partial into its final output file. Removes
+    /// the partial directory on success.
+    func recoverPartial(_ partial: PartialRecording) async {
+        guard !recoveringPartialIDs.contains(partial.id) else { return }
+        recoveringPartialIDs.insert(partial.id)
+        defer {
+            recoveringPartialIDs.remove(partial.id)
+            refreshOrphans()
+        }
+
+        do {
+            let url = try await mixer.mix(partial)
+            partialStore.delete(partial)
+            logger.info("Recovered partial \(partial.id) → \(url.lastPathComponent)")
+        } catch {
+            lastError = error
+            logger.error("Failed to recover partial \(partial.id): \(error.localizedDescription)")
+        }
+    }
+
+    /// Recovers all known orphan partials sequentially.
+    func recoverAllOrphans() async {
+        for partial in orphanPartials {
+            await recoverPartial(partial)
+        }
+    }
+
+    /// Removes an orphan partial without attempting to recover it.
+    func discardPartial(_ partial: PartialRecording) {
+        partialStore.delete(partial)
+        refreshOrphans()
     }
 
     // MARK: - Helpers

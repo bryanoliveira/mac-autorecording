@@ -211,13 +211,13 @@ final class SettingsStore {
 
     // MARK: - File Generation
 
-    /// Generates a temporary output URL for a new recording (will be renamed later)
-    func generateTempOutputURL(withVideo: Bool) -> URL {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HH.mm.ss"
-        let timestamp = formatter.string(from: Date())
-        let ext = withVideo ? "mov" : "m4a"
-        let filename = "MeetingAssistant_\(timestamp).\(ext)"
+    /// Generates the URL the final mixed recording will be written to.
+    /// `id` should be a stable identifier (e.g. the recording's start
+    /// timestamp) so the partial directory and the final file can be
+    /// correlated in case of a crash.
+    func generateFinalOutputURL(id: String, withVideo: Bool) -> URL {
+        let ext = withVideo ? "mov" : "wav"
+        let filename = "MeetingAssistant_\(id).\(ext)"
         return outputDirectory.appending(path: filename)
     }
 }

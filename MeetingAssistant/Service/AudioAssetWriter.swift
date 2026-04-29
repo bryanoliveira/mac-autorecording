@@ -2,8 +2,14 @@
 //  AudioAssetWriter.swift
 //  MeetingAssistant
 //
-//  Writes captured audio (and optional video) to disk using AVAssetWriter.
-//  Optimized for lightweight, transcription-quality recordings.
+//  Coordinates writing of mic, system audio, and (optional) video to
+//  per-stream sidecars under a `PartialRecording` directory. Each
+//  audio stream is written as raw PCM with no container, which makes
+//  the on-disk state crash-resilient: every byte that hits disk is a
+//  sample, and the format is recorded in `meta.json` upfront.
+//
+//  Mixing into a single user-facing file is performed afterwards by
+//  `RecordingMixer`, never on the capture queues.
 //
 
 import Foundation
@@ -13,348 +19,278 @@ import VideoToolbox
 import OSLog
 import os
 
-/// Writes captured media to disk — lightweight codec settings for meeting recordings
+/// Receives capture sample buffers and routes each into a per-stream sidecar.
 final class AudioAssetWriter: RecordingEngineSampleBufferDelegate, @unchecked Sendable {
 
-    // MARK: - Properties
-
-    private var assetWriter: AVAssetWriter?
-    private var audioInput: AVAssetWriterInput?
-    private var microphoneInput: AVAssetWriterInput?
-    private var videoInput: AVAssetWriterInput?
-    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    // MARK: - State
 
     private(set) var isWriting = false
-    private(set) var outputURL: URL?
+    private(set) var partial: PartialRecording?
     private(set) var hasVideo = false
 
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "MeetingAssistant", category: "AudioAssetWriter")
-
-    private var hasStartedSession = false
-    private var sessionStartTime: CMTime = .zero
-    private var frameCount = 0
-
-    private let lock = OSAllocatedUnfairLock()
-
     /// When true, incoming samples are dropped (recording is paused).
-    /// Set by the ViewModel when the user pauses the recording.
     private let _isPaused = OSAllocatedUnfairLock(initialState: false)
     var isPaused: Bool {
         get { _isPaused.withLock { $0 } }
         set { _isPaused.withLock { $0 = newValue } }
     }
 
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "MeetingAssistant", category: "AudioAssetWriter")
+
+    // MARK: - Writers
+
+    private var micWriter: StreamPCMWriter?
+    private var systemWriter: StreamPCMWriter?
+
+    private var videoWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var hasStartedVideoSession = false
+
+    /// Guards access to `partial.metadata` (mutated from capture queues).
+    private let metaLock = OSAllocatedUnfairLock()
+    /// One-shot flags so we only persist the format/timestamp once each.
+    private var micMetaPersisted = false
+    private var systemMetaPersisted = false
+
     // MARK: - Setup
 
-    /// Prepares the writer for audio-only recording
-    func setupAudioOnly(url: URL, includeSystemAudio: Bool) throws {
-        try prepareDirectory(for: url)
-
-        assetWriter = try AVAssetWriter(outputURL: url, fileType: .m4a)
-        guard let assetWriter else {
-            throw AssetWriterError.failedToCreateWriter
-        }
-
-        // Microphone track — lightweight AAC for speech
-        let micSettings = createSpeechAudioSettings()
-        microphoneInput = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
-        microphoneInput?.expectsMediaDataInRealTime = true
-
-        if let microphoneInput, assetWriter.canAdd(microphoneInput) {
-            assetWriter.add(microphoneInput)
-        }
-
-        // System audio track
-        if includeSystemAudio {
-            let sysSettings = createSpeechAudioSettings()
-            audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: sysSettings)
-            audioInput?.expectsMediaDataInRealTime = true
-
-            if let audioInput, assetWriter.canAdd(audioInput) {
-                assetWriter.add(audioInput)
-            }
-        }
-
-        outputURL = url
+    /// Prepares the writers for an audio-only recording.
+    func setupAudioOnly(partial: PartialRecording) throws {
+        try setupCommon(partial: partial)
         hasVideo = false
-        hasStartedSession = false
-        sessionStartTime = .zero
-        frameCount = 0
-
-        logger.info("Writer configured for audio-only: \(url.lastPathComponent)")
+        logger.info("Writers configured for audio-only at \(partial.directory.lastPathComponent)")
     }
 
-    /// Prepares the writer for video + audio recording
-    func setupWithVideo(url: URL, videoSize: CGSize, includeSystemAudio: Bool) throws {
-        try prepareDirectory(for: url)
+    /// Prepares the writers for a video + audio recording.
+    func setupWithVideo(partial: PartialRecording, videoSize: CGSize) throws {
+        try setupCommon(partial: partial)
+        hasVideo = true
 
-        assetWriter = try AVAssetWriter(outputURL: url, fileType: .mov)
-        guard let assetWriter else {
+        // Video sidecar: HEVC MOV with no audio track. Audio goes into the
+        // PCM sidecars and is composed into the final MOV after mixing.
+        guard let videoURL = partial.videoURL else {
             throw AssetWriterError.failedToCreateWriter
         }
+        if FileManager.default.fileExists(atPath: videoURL.path()) {
+            try FileManager.default.removeItem(at: videoURL)
+        }
 
-        // Video track — low bitrate HEVC for small file size
+        let writer = try AVAssetWriter(outputURL: videoURL, fileType: .mov)
         let videoSettings = createLowBitrateVideoSettings(size: videoSize)
-        videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput?.expectsMediaDataInRealTime = true
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        input.expectsMediaDataInRealTime = true
 
-        if let videoInput, assetWriter.canAdd(videoInput) {
-            assetWriter.add(videoInput)
-
-            let sourcePixelBufferAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: Int(videoSize.width),
-                kCVPixelBufferHeightKey as String: Int(videoSize.height)
-            ]
-            pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: videoInput,
-                sourcePixelBufferAttributes: sourcePixelBufferAttributes
-            )
+        guard writer.canAdd(input) else {
+            throw AssetWriterError.failedToCreateWriter
         }
+        writer.add(input)
 
-        // Mic track
-        let micSettings = createSpeechAudioSettings()
-        microphoneInput = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
-        microphoneInput?.expectsMediaDataInRealTime = true
-        if let microphoneInput, assetWriter.canAdd(microphoneInput) {
-            assetWriter.add(microphoneInput)
-        }
+        let pbxAttrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: Int(videoSize.width),
+            kCVPixelBufferHeightKey as String: Int(videoSize.height)
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: pbxAttrs
+        )
 
-        // System audio track
-        if includeSystemAudio {
-            let sysSettings = createSpeechAudioSettings()
-            audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: sysSettings)
-            audioInput?.expectsMediaDataInRealTime = true
-            if let audioInput, assetWriter.canAdd(audioInput) {
-                assetWriter.add(audioInput)
-            }
-        }
+        self.videoWriter = writer
+        self.videoInput = input
+        self.pixelBufferAdaptor = adaptor
 
-        outputURL = url
-        hasVideo = true
-        hasStartedSession = false
-        sessionStartTime = .zero
-        frameCount = 0
-
-        logger.info("Writer configured for video+audio: \(url.lastPathComponent)")
+        logger.info("Writers configured for video+audio at \(partial.directory.lastPathComponent)")
     }
 
-    // MARK: - Writing
+    private func setupCommon(partial: PartialRecording) throws {
+        try FileManager.default.createDirectory(at: partial.directory, withIntermediateDirectories: true)
+        self.partial = partial
+        self.micMetaPersisted = false
+        self.systemMetaPersisted = false
+        self.hasStartedVideoSession = false
+        self.videoWriter = nil
+        self.videoInput = nil
+        self.pixelBufferAdaptor = nil
+        self.micWriter = try StreamPCMWriter(url: partial.micURL)
+        self.systemWriter = try StreamPCMWriter(url: partial.systemURL)
+    }
+
+    // MARK: - Lifecycle
 
     func startWriting() throws {
-        guard let assetWriter, assetWriter.status == .unknown else {
+        if let videoWriter {
+            guard videoWriter.status == .unknown else {
+                throw AssetWriterError.writerNotReady
+            }
+            guard videoWriter.startWriting() else {
+                throw AssetWriterError.failedToStartWriting(videoWriter.error)
+            }
+        }
+        isWriting = true
+        logger.info("Writers started")
+    }
+
+    /// Closes all writers and returns the partial. The caller is responsible
+    /// for invoking `RecordingMixer` to produce the final output file.
+    func finishWriting() async throws -> PartialRecording {
+        guard isWriting, var partial = self.partial else {
             throw AssetWriterError.writerNotReady
         }
 
-        guard assetWriter.startWriting() else {
-            throw AssetWriterError.failedToStartWriting(assetWriter.error)
-        }
+        let micHasData = micWriter?.hasReceivedSample == true
+        let systemHasData = systemWriter?.hasReceivedSample == true
 
-        isWriting = true
-        logger.info("Writer started")
-    }
-
-    // MARK: - Sample Buffer Appending
-
-    func appendAudioSample(_ sampleBuffer: CMSampleBuffer) {
-        guard !isPaused else { return }
-        lock.withLockUnchecked {
-            guard let assetWriter,
-                  assetWriter.status == .writing,
-                  let audioInput,
-                  audioInput.isReadyForMoreMediaData else { return }
-
-            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            startSessionIfNeeded(at: time, writer: assetWriter)
-
-            if !audioInput.append(sampleBuffer) {
-                logger.error("Failed to append system audio sample")
+        // Drain any final metadata into the partial before persisting.
+        metaLock.withLockUnchecked {
+            if let mic = self.micWriter, !self.micMetaPersisted {
+                partial.metadata.mic.format = mic.format
+                partial.metadata.mic.firstSampleSeconds = mic.firstSampleSeconds
+                self.micMetaPersisted = true
+            }
+            if let sys = self.systemWriter, !self.systemMetaPersisted {
+                partial.metadata.system.format = sys.format
+                partial.metadata.system.firstSampleSeconds = sys.firstSampleSeconds
+                self.systemMetaPersisted = true
             }
         }
-    }
 
-    func appendMicrophoneSample(_ sampleBuffer: CMSampleBuffer) {
-        guard !isPaused else { return }
-        lock.withLockUnchecked {
-            guard let assetWriter,
-                  assetWriter.status == .writing,
-                  let microphoneInput,
-                  microphoneInput.isReadyForMoreMediaData else { return }
+        micWriter?.finishWriting()
+        systemWriter?.finishWriting()
+        micWriter = nil
+        systemWriter = nil
 
-            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            startSessionIfNeeded(at: time, writer: assetWriter)
-
-            if !microphoneInput.append(sampleBuffer) {
-                logger.error("Failed to append microphone sample")
-            }
+        if let videoWriter, let videoInput {
+            videoInput.markAsFinished()
+            await videoWriter.finishWriting()
+            self.videoWriter = nil
+            self.videoInput = nil
+            self.pixelBufferAdaptor = nil
         }
-    }
 
-    func appendVideoSample(_ sampleBuffer: CMSampleBuffer) {
-        guard !isPaused else { return }
-        // Check frame status
-        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
-              let attachments = attachmentsArray.first,
-              let statusRawValue = attachments[SCStreamFrameInfo.status.rawValue] as? Int,
-              let status = SCFrameStatus(rawValue: statusRawValue),
-              status == .complete else { return }
+        try partial.writeMetadata()
+        self.partial = partial
+        isWriting = false
 
-        lock.withLockUnchecked {
-            guard let assetWriter,
-                  assetWriter.status == .writing,
-                  let videoInput,
-                  videoInput.isReadyForMoreMediaData,
-                  let adaptor = pixelBufferAdaptor else { return }
-
-            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            startSessionIfNeeded(at: time, writer: assetWriter)
-
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-            if adaptor.append(pixelBuffer, withPresentationTime: time) {
-                frameCount += 1
-            } else {
-                logger.error("Failed to append video frame")
-            }
-        }
-    }
-
-    private func startSessionIfNeeded(at time: CMTime, writer: AVAssetWriter) {
-        if !hasStartedSession {
-            writer.startSession(atSourceTime: time)
-            sessionStartTime = time
-            hasStartedSession = true
-        }
-    }
-
-    // MARK: - Finalization
-
-    func finishWriting() async throws -> URL {
-        let (writerToFinish, url): (AVAssetWriter, URL)
-
-        do {
-            (writerToFinish, url) = try lock.withLockUnchecked {
-                guard let assetWriter, isWriting else {
-                    throw AssetWriterError.writerNotReady
-                }
-                guard let url = outputURL else {
-                    throw AssetWriterError.noOutputURL
-                }
-                guard hasStartedSession else {
-                    throw AssetWriterError.noDataWritten
-                }
-
-                videoInput?.markAsFinished()
-                audioInput?.markAsFinished()
-                microphoneInput?.markAsFinished()
-
-                return (assetWriter, url)
-            }
-        } catch AssetWriterError.noDataWritten {
-            cancel()
+        guard micHasData || systemHasData else {
             throw AssetWriterError.noDataWritten
         }
 
-        await writerToFinish.finishWriting()
-
-        return try lock.withLockUnchecked {
-            guard let assetWriter else {
-                throw AssetWriterError.writerNotReady
-            }
-
-            if assetWriter.status == .failed {
-                throw AssetWriterError.writingFailed(assetWriter.error)
-            }
-
-            isWriting = false
-            hasStartedSession = false
-
-            logger.info("Finished writing to: \(url.lastPathComponent)")
-
-            // Clean up
-            self.assetWriter = nil
-            self.videoInput = nil
-            self.pixelBufferAdaptor = nil
-            self.audioInput = nil
-            self.microphoneInput = nil
-
-            return url
-        }
+        return partial
     }
 
+    /// Cancels the current recording and removes the partial directory.
     func cancel() {
-        lock.withLockUnchecked {
-            assetWriter?.cancelWriting()
-            isWriting = false
-            hasStartedSession = false
-            frameCount = 0
+        micWriter?.finishWriting()
+        systemWriter?.finishWriting()
+        micWriter = nil
+        systemWriter = nil
 
-            if let url = outputURL {
-                try? FileManager.default.removeItem(at: url)
-            }
-
-            assetWriter = nil
-            videoInput = nil
-            pixelBufferAdaptor = nil
-            audioInput = nil
-            microphoneInput = nil
-            outputURL = nil
-
-            logger.info("Writer cancelled")
+        if let videoWriter {
+            videoWriter.cancelWriting()
         }
+        videoWriter = nil
+        videoInput = nil
+        pixelBufferAdaptor = nil
+
+        if let partial {
+            try? FileManager.default.removeItem(at: partial.directory)
+        }
+        self.partial = nil
+        isWriting = false
+        hasStartedVideoSession = false
+        logger.info("Writers cancelled")
     }
 
     // MARK: - RecordingEngineSampleBufferDelegate
 
     func recordingEngine(_ engine: RecordingEngine, didOutputAudioSampleBuffer sampleBuffer: CMSampleBuffer) {
-        appendAudioSample(sampleBuffer)
+        guard !isPaused, let writer = systemWriter else { return }
+        let learned = writer.append(sampleBuffer)
+        if learned { persistSystemMetadata(format: writer.format, firstSeconds: writer.firstSampleSeconds) }
     }
 
     func recordingEngine(_ engine: RecordingEngine, didOutputMicrophoneSampleBuffer sampleBuffer: CMSampleBuffer) {
-        appendMicrophoneSample(sampleBuffer)
+        guard !isPaused, let writer = micWriter else { return }
+        let learned = writer.append(sampleBuffer)
+        if learned { persistMicMetadata(format: writer.format, firstSeconds: writer.firstSampleSeconds) }
     }
 
     func recordingEngine(_ engine: RecordingEngine, didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer) {
-        appendVideoSample(sampleBuffer)
+        guard !isPaused, let videoWriter, let videoInput, let adaptor = pixelBufferAdaptor else { return }
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
+              let attachments = attachmentsArray.first,
+              let statusRaw = attachments[SCStreamFrameInfo.status.rawValue] as? Int,
+              let status = SCFrameStatus(rawValue: statusRaw),
+              status == .complete else { return }
+
+        guard videoInput.isReadyForMoreMediaData else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        if !hasStartedVideoSession {
+            videoWriter.startSession(atSourceTime: time)
+            hasStartedVideoSession = true
+            persistVideoFirstTime(time: CMTimeGetSeconds(time))
+        }
+
+        if !adaptor.append(pixelBuffer, withPresentationTime: time) {
+            logger.error("Failed to append video frame")
+        }
+    }
+
+    // MARK: - Metadata persistence
+
+    /// Persists mic format/timestamp on the first sample. Safe to call from any thread.
+    private func persistMicMetadata(format: PCMStreamFormat?, firstSeconds: Double?) {
+        let toWrite: PartialRecording? = metaLock.withLockUnchecked {
+            guard !self.micMetaPersisted, var p = self.partial else { return nil }
+            self.micMetaPersisted = true
+            p.metadata.mic.format = format
+            p.metadata.mic.firstSampleSeconds = firstSeconds
+            self.partial = p
+            return p
+        }
+        if let toWrite { try? toWrite.writeMetadata() }
+    }
+
+    private func persistSystemMetadata(format: PCMStreamFormat?, firstSeconds: Double?) {
+        let toWrite: PartialRecording? = metaLock.withLockUnchecked {
+            guard !self.systemMetaPersisted, var p = self.partial else { return nil }
+            self.systemMetaPersisted = true
+            p.metadata.system.format = format
+            p.metadata.system.firstSampleSeconds = firstSeconds
+            self.partial = p
+            return p
+        }
+        if let toWrite { try? toWrite.writeMetadata() }
+    }
+
+    private func persistVideoFirstTime(time: Double) {
+        let toWrite: PartialRecording? = metaLock.withLockUnchecked {
+            guard var p = self.partial, p.metadata.video?.firstSampleSeconds == nil else { return nil }
+            p.metadata.video?.firstSampleSeconds = time
+            self.partial = p
+            return p
+        }
+        if let toWrite { try? toWrite.writeMetadata() }
     }
 
     // MARK: - Settings
 
-    /// Speech-optimized AAC: 64 kbps, 44.1 kHz, mono (~30 MB/hour)
-    private func createSpeechAudioSettings() -> [String: Any] {
-        [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 44100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey: 64000
-        ]
-    }
-
-    /// Low-bitrate HEVC video settings for meeting recordings
+    /// Low-bitrate HEVC video settings for meeting recordings.
     private func createLowBitrateVideoSettings(size: CGSize) -> [String: Any] {
         [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: Int(size.width),
             AVVideoHeightKey: Int(size.height),
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 500_000, // 500 kbps — sufficient for screen content
+                AVVideoAverageBitRateKey: 500_000,
                 AVVideoExpectedSourceFrameRateKey: 15,
                 AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main_AutoLevel as String
             ] as [String: Any]
         ]
     }
-
-    // MARK: - Helpers
-
-    private func prepareDirectory(for url: URL) throws {
-        let directory = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        if FileManager.default.fileExists(atPath: url.path()) {
-            try FileManager.default.removeItem(at: url)
-        }
-    }
-
 }
 
 // MARK: - Errors

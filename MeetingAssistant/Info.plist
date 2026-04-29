@@ -8,7 +8,5 @@
 	<string>MeetingAssistant needs microphone access to record meeting audio.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>MeetingAssistant needs screen recording access to optionally capture your screen during meetings.</string>
-	<key>NSCalendarsFullAccessUsageDescription</key>
-	<string>MeetingAssistant uses your calendar to name recordings after meeting events.</string>
 </dict>
 </plist>

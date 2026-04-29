@@ -36,6 +36,16 @@ struct MenuBarDropdownView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
+            // Orphan recovery banner — shown whenever partial recordings
+            // from a previous run are sitting on disk waiting to be mixed.
+            if viewModel.hasOrphans && !viewModel.isRecordingOrPaused {
+                Divider()
+                    .padding(.horizontal, 12)
+                orphanBanner
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+            }
+
             Divider()
                 .padding(.horizontal, 12)
 
@@ -45,6 +55,9 @@ struct MenuBarDropdownView: View {
                 .padding(.vertical, 8)
         }
         .frame(width: 280)
+        .onAppear {
+            viewModel.refreshOrphans()
+        }
     }
 
     // MARK: - Status Header
@@ -253,6 +266,58 @@ struct MenuBarDropdownView: View {
                 permissionWarning
             }
         }
+    }
+
+    // MARK: - Orphan Recovery Banner
+
+    @ViewBuilder
+    private var orphanBanner: some View {
+        let count = viewModel.orphanPartials.count
+        let isWorking = !viewModel.recoveringPartialIDs.isEmpty
+        let countText = count == 1 ? "1 unfinished recording" : "\(count) unfinished recordings"
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.uturn.backward.circle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.system(size: 14))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(countText)
+                        .font(.system(size: 12, weight: .medium))
+                    Text("Mix saved sidecars into final files.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 6) {
+                if isWorking {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Recovering…")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                } else {
+                    Button("Recover All") {
+                        Task { await viewModel.recoverAllOrphans() }
+                    }
+                    .controlSize(.small)
+
+                    SettingsLink {
+                        Text("Review")
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+
+                    Spacer()
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
     }
 
     // MARK: - Permission Warning

@@ -11,7 +11,7 @@ import Carbon.HIToolbox
 
 struct SettingsView: View {
 
-    let viewModel: MeetingRecorderViewModel
+    @Bindable var viewModel: MeetingRecorderViewModel
 
     var body: some View {
         TabView {
@@ -22,15 +22,20 @@ struct SettingsView: View {
 
             MicrophoneSettingsView(viewModel: viewModel, settings: viewModel.settings)
                 .tabItem {
-                    Label("Microphone", systemImage: "mic")
+                    Label("Shortcuts", systemImage: "keyboard")
                 }
 
-            PermissionsSettingsView(permissionService: viewModel.permissionService, calendarService: viewModel.calendarService)
+            RecoverySettingsView(viewModel: viewModel)
+                .tabItem {
+                    Label("Recovery", systemImage: "arrow.uturn.backward.circle")
+                }
+
+            PermissionsSettingsView(permissionService: viewModel.permissionService)
                 .tabItem {
                     Label("Permissions", systemImage: "lock.shield")
                 }
         }
-        .frame(width: 480, height: 420)
+        .frame(width: 520, height: 460)
     }
 }
 
@@ -98,15 +103,16 @@ struct GeneralSettingsView: View {
 
             Section("Info") {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Audio: AAC 64 kbps mono (~30 MB/hour)")
+                    Text("Audio: PCM 16-bit / 16 kHz / mono (~115 MB/hour)")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     Text("Video: HEVC 500 kbps 15 fps (when enabled)")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                    Text("Files named after matching calendar events")
+                    Text("Mic and system audio are written to separate sidecar files while recording, then mixed into the final file when you stop. If the app crashes, the Recovery tab can rebuild the recording from those sidecars.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .padding(.top, 2)
                 }
             }
         }
@@ -241,12 +247,123 @@ class ShortcutCaptureView: NSView {
     }
 }
 
+// MARK: - Recovery Settings
+
+/// Lists partial recordings left behind by previous crashes and offers
+/// to mix them into final files (or discard them).
+struct RecoverySettingsView: View {
+
+    @Bindable var viewModel: MeetingRecorderViewModel
+
+    var body: some View {
+        Form {
+            Section("Orphan Recordings") {
+                if viewModel.orphanPartials.isEmpty {
+                    HStack(spacing: 10) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("Nothing to recover.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                } else {
+                    ForEach(viewModel.orphanPartials) { partial in
+                        OrphanRow(viewModel: viewModel, partial: partial)
+                    }
+
+                    HStack {
+                        Spacer()
+                        Button("Recover All") {
+                            Task { await viewModel.recoverAllOrphans() }
+                        }
+                        .controlSize(.small)
+                        .disabled(!viewModel.recoveringPartialIDs.isEmpty)
+                    }
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Refresh") {
+                        viewModel.refreshOrphans()
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            Section("About Recovery") {
+                Text("Each recording is captured into per-stream sidecar files (mic and system audio in raw PCM, plus optional video). When you stop, those sidecars are mixed into a single file. If the app exits unexpectedly while recording, the sidecars stay on disk and show up here so you can rebuild the file.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+        .onAppear {
+            viewModel.refreshOrphans()
+        }
+    }
+}
+
+private struct OrphanRow: View {
+    @Bindable var viewModel: MeetingRecorderViewModel
+    let partial: PartialRecording
+
+    private var isWorking: Bool {
+        viewModel.recoveringPartialIDs.contains(partial.id)
+    }
+
+    private var subtitle: String {
+        let fm = DateFormatter()
+        fm.dateStyle = .medium
+        fm.timeStyle = .short
+        let when = fm.string(from: partial.metadata.startedAt)
+        let kind = partial.metadata.withVideo ? "Video + Audio" : "Audio"
+        return "\(when) • \(kind)"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: partial.metadata.withVideo ? "video.circle" : "waveform.circle")
+                .font(.system(size: 18))
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(partial.id)
+                    .font(.system(size: 12, weight: .medium))
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if isWorking {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Button("Recover") {
+                    Task { await viewModel.recoverPartial(partial) }
+                }
+                .controlSize(.small)
+
+                Button(role: .destructive) {
+                    viewModel.discardPartial(partial)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 // MARK: - Permissions Settings
 
 struct PermissionsSettingsView: View {
 
     let permissionService: PermissionService
-    let calendarService: CalendarService
 
     var body: some View {
         Form {
@@ -266,17 +383,34 @@ struct PermissionsSettingsView: View {
                 )
             }
 
-            Section("Optional Permissions") {
-                PermissionRow(
-                    title: "Calendar",
-                    description: "Name recordings after calendar events",
-                    state: permissionService.calendarState,
-                    action: { permissionService.openCalendarSettings() }
-                )
+            Section("Diagnostics") {
+                VStack(alignment: .leading, spacing: 4) {
+                    diagRow("Mic", "\(permissionService.microphoneState)")
+                    diagRow("Screen Recording", "\(permissionService.screenRecordingState)")
+                    if let path = Bundle.main.executablePath {
+                        diagRow("Binary", path)
+                    }
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
             }
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear {
+            permissionService.updatePermissionStates()
+        }
+    }
+
+    private func diagRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top) {
+            Text(label + ":")
+                .frame(width: 140, alignment: .trailing)
+            Text(value)
+                .foregroundStyle(.primary)
+            Spacer()
+        }
     }
 }
 
@@ -316,3 +450,4 @@ struct PermissionRow: View {
         }
     }
 }
+

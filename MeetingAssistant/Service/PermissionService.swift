@@ -2,13 +2,12 @@
 //  PermissionService.swift
 //  MeetingAssistant
 //
-//  Checks and requests system permissions for microphone,
-//  screen recording, and calendar access.
+//  Checks and requests system permissions for microphone
+//  and screen recording.
 //
 
 import AVFoundation
 import CoreGraphics
-import EventKit
 import Foundation
 import OSLog
 import AppKit
@@ -20,15 +19,22 @@ final class PermissionService {
 
     // MARK: - Permission States
 
-    enum PermissionState {
+    enum PermissionState: CustomStringConvertible {
         case unknown
         case granted
         case denied
+
+        var description: String {
+            switch self {
+            case .unknown: return "unknown"
+            case .granted: return "granted"
+            case .denied: return "denied"
+            }
+        }
     }
 
     private(set) var microphoneState: PermissionState = .unknown
     private(set) var screenRecordingState: PermissionState = .unknown
-    private(set) var calendarState: PermissionState = .unknown
 
     var allRequiredPermissionsGranted: Bool {
         microphoneState == .granted && screenRecordingState == .granted
@@ -47,7 +53,7 @@ final class PermissionService {
     func updatePermissionStates() {
         microphoneState = checkMicrophonePermission()
         screenRecordingState = checkScreenRecordingPermission()
-        calendarState = checkCalendarPermission()
+        logger.info("Permission states - Mic: \(self.microphoneState), Screen: \(self.screenRecordingState)")
     }
 
     private func checkMicrophonePermission() -> PermissionState {
@@ -63,41 +69,22 @@ final class PermissionService {
         CGPreflightScreenCaptureAccess() ? .granted : .denied
     }
 
-    private func checkCalendarPermission() -> PermissionState {
-        switch EKEventStore.authorizationStatus(for: .event) {
-        case .fullAccess: return .granted
-        case .notDetermined: return .unknown
-        case .denied, .restricted, .writeOnly: return .denied
-        @unknown default: return .unknown
-        }
-    }
-
     // MARK: - Request Permissions
 
+    /// Requests only the microphone permission if not yet determined.
+    /// Screen recording is only checked (on Sequoia there is no native dialog).
     func requestPermissions() async {
-        // Microphone
-        if microphoneState != .granted {
+        updatePermissionStates()
+
+        if microphoneState == .unknown {
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             microphoneState = granted ? .granted : .denied
+            logger.info("Mic permission prompted: \(granted)")
         }
 
-        // Screen recording
-        if screenRecordingState != .granted {
-            let granted = CGRequestScreenCaptureAccess()
-            screenRecordingState = granted ? .granted : .denied
-        }
+        screenRecordingState = checkScreenRecordingPermission()
 
-        // Calendar
-        if calendarState != .granted {
-            do {
-                let granted = try await EKEventStore().requestFullAccessToEvents()
-                calendarState = granted ? .granted : .denied
-            } catch {
-                calendarState = .denied
-            }
-        }
-
-        logger.info("Permissions - Mic: \(String(describing: self.microphoneState)), Screen: \(String(describing: self.screenRecordingState)), Calendar: \(String(describing: self.calendarState))")
+        logger.info("After requests - Mic: \(self.microphoneState), Screen: \(self.screenRecordingState)")
     }
 
     // MARK: - Open Settings
@@ -110,12 +97,6 @@ final class PermissionService {
 
     func openScreenRecordingSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    func openCalendarSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
             NSWorkspace.shared.open(url)
         }
     }
